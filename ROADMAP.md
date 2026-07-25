@@ -177,6 +177,16 @@ client sees their stores. Pilot in real stores by August.
   camera across all clients — status, camera health (FPS, camera_ok) and a
   data-flow signal (last metric + passersby/24h). Endpoints `/v1/admin/me`,
   `/overview`, enriched `/fleet`.
+- ☑ **Foot-traffic flow (direction of arrival).** The pipeline resolves each departing
+  passer-by's net horizontal displacement into `pipeline.flow` (came-from-left vs
+  came-from-right, with an engaged split and an `ambiguous` bucket for barely-moving
+  tracks) — anonymous (a direction sign, never a path/identity). Live in `/api/stats`
+  and persisted per session in `metrics_history.jsonl`; the live dashboard shows a
+  "Foot-traffic flow" panel (split bar + "what share of each side stopped to look").
+  Sides are camera-relative; operator names them in `device.yaml`. Verified: unit test
+  on `_tally_flow` + preview render. (Enrichment idea #5 from the 2026-07-24 dashboard
+  brainstorm; the remaining ideas — capture-rate funnel, window-change A/B, hour×day
+  heatmap, dwell histogram — stay on the backlog.)
 - ☐ Remote per-store config editing: a server→edge config channel (server stores
   the config, the edge box pulls it and reconfigures) + a simple form UI in the
   staff panel (camera position, window width, engagement-zone, thresholds), so a
@@ -281,6 +291,34 @@ recording made it miss intermittent far-range hits). Retrain = `src/training/
 train.py` → drop in `models/engagement_model.pth`. Tip: collect the bulk via
 directed auto, but build the held-out EVAL set via careful manual L/A (it's the
 measuring stick). *(Lands around Phase 5, once a real install exists.)*
+
+## Exploratory — live analytical agent (idea, not scheduled)
+> Captured 2026-07-24 from a design chat. Not on the pilot critical path; note so it
+> isn't re-litigated. Post-August unless a pilot explicitly asks for it.
+
+Give the metrics a **voice**: an LLM/agent that periodically narrates *what's
+happening now* in anonymous, aggregate terms — a self-filling feed on the dashboard
+(*"18:00–18:10 · 18 pasaron, 4 pararon (22%), atención 6s. Ritmo estable."*).
+
+- **Firm decision — the agent never sees pixels.** It consumes the *structured
+  anonymous state* the pipeline already produces (counts, look/away, dwell, tier),
+  not video. Keeps the golden rule intact and dodges the latency/cost of an LLM in
+  the CV hot path.
+- **Cadence: sampled, not live, not post-mortem.** A daemon tick every ~10 min reads
+  a rolling window of scalars + the previous tick's summary (so it can say "ritmo
+  bajando vs bloque previo"). Rejected alternatives: LLM-per-frame (breaks real-time
+  + all-local) and end-of-day only (loses the temporal texture).
+- **Hook points (verified in `edge/agent/webserver.py`):** ring buffer +
+  `insights` timeline on `_SharedState` (~L79); push cumulative scalars 1/s right
+  after the `state.stats.update` in the loop (~L898); a `_insight_tick` daemon
+  thread started in `run()` that diffs window start/end → deltas → agent →
+  `state.insights`; `GET /api/insights` endpoint (~L360); a feed panel polling ~30s.
+  Keep a **deterministic template fallback** for 100%-offline mode.
+- **MVP vs enrichment:** MVP feeds *aggregate deltas* (passed/stopped/attention) —
+  zero pipeline changes. Richer narratives ("most arrived from the left", "they stop
+  but don't look") need **per-track summary events** (dwell, looked, entry_side)
+  emitted on `pipeline.expire()` (`pipeline.py` ~L182). Start with deltas.
+- ☐ Not started. MVP is ~low-medium effort; do only if a pilot wants live insight.
 
 ## Deferred until after August (scope discipline)
 Stripe/billing · OTA auto-updates · self-service multi-tenant signup · model retrain from scratch.

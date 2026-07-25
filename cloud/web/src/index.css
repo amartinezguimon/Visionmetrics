@@ -16,10 +16,47 @@
   --gray6: #f5f5f5;
 }
 
+html {
+  scroll-behavior: smooth;
+}
+
 html,
 body,
 #root {
   height: 100%;
+}
+
+/* Fluid, Apple-like micro-interactions ------------------------------------ */
+button,
+a,
+select,
+[role="button"] {
+  transition: color 0.18s ease, background-color 0.18s ease, box-shadow 0.18s ease,
+    transform 0.18s ease, opacity 0.18s ease, border-color 0.18s ease;
+}
+
+/* Every content card gets a soft lift on hover. */
+.rounded-card {
+  transition: box-shadow 0.25s ease, transform 0.25s ease;
+}
+.rounded-card:hover {
+  box-shadow: 0 12px 30px rgba(28, 28, 28, 0.08);
+  transform: translateY(-2px);
+}
+
+/* Press feedback for primary actions. */
+button:active {
+  transform: translateY(1px) scale(0.99);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition: none !important;
+    animation: none !important;
+    scroll-behavior: auto !important;
+  }
 }
 
 body {

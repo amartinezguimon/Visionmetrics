@@ -1,0 +1,880 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>VisionMetrics — Video Labeler</title>
+<!--VM_EMBED_PLACEHOLDER-->
+<style>
+  :root {
+    --look:#2ecc71; --away:#e74c3c; --new:#3498db; --reject:#e67e22;
+    --bg:#0d0f14; --panel:#161922; --panel2:#1b1f2a; --border:#272c38;
+    --text:#e8eaf0; --muted:#8892a6; --accent:#5b8cff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin:0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background:var(--bg); color:var(--text); -webkit-font-smoothing:antialiased;
+  }
+  header {
+    display:flex; align-items:center; gap:12px; padding:16px 24px;
+    background:linear-gradient(180deg, #171b25, #131620); border-bottom:1px solid var(--border);
+  }
+  #logo {
+    width:34px; height:34px; border-radius:9px; flex:none;
+    background:linear-gradient(135deg, var(--accent), #8a5bff);
+    display:flex; align-items:center; justify-content:center;
+    font-weight:700; font-size:13px; color:#fff; letter-spacing:0.5px;
+    box-shadow:0 2px 8px rgba(91,140,255,0.35);
+  }
+  header h1 { font-size:17px; margin:0 0 3px; font-weight:600; letter-spacing:0.2px; }
+  header p { font-size:12.5px; color:var(--muted); margin:0; line-height:1.5; }
+  header p b { color:#cdd4e4; }
+
+  #drops { display:flex; gap:16px; padding:22px 24px; }
+  .drop {
+    flex:1; border:2px dashed #33394a; border-radius:12px; padding:26px 20px; text-align:center;
+    color:var(--muted); transition:0.15s; cursor:pointer; background:rgba(255,255,255,0.015);
+    font-size:13px; line-height:1.6;
+  }
+  .drop:hover { border-color:#454d63; background:rgba(255,255,255,0.03); }
+  .drop.over { border-color:var(--accent); background:rgba(91,140,255,0.08); color:#dbe4ff; }
+  .drop.done { border-color:var(--look); background:rgba(46,204,113,0.07); color:#dcf7e6; }
+
+  #workspace { display:none; padding:8px 24px 28px; max-width:1400px; }
+
+  #modebar {
+    display:flex; align-items:center; gap:10px; margin-bottom:14px; flex-wrap:wrap;
+    background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:6px;
+    width:fit-content;
+  }
+  button {
+    background:transparent; color:var(--text); border:1px solid transparent; border-radius:7px;
+    padding:8px 14px; cursor:pointer; font-size:13px; font-weight:500; transition:0.12s;
+  }
+  #modebar button { color:var(--muted); }
+  #modebar button.active { background:var(--accent); color:#fff; }
+  button:not(#modebar button):hover { background:#242a38; border-color:#3a4054; }
+  button.primary { background:var(--look); color:#08240f; font-weight:600; border-color:var(--look); }
+  button.primary:hover { filter:brightness(1.08); }
+  #statusText { color:var(--muted); font-size:12px; margin-left:6px; }
+
+  #stage {
+    position:relative; display:inline-block; max-width:940px; width:100%;
+    border-radius:12px; overflow:hidden; border:1px solid var(--border);
+    box-shadow:0 6px 24px rgba(0,0,0,0.35);
+  }
+  video { display:block; width:100%; max-width:940px; background:#000; }
+  canvas { position:absolute; top:0; left:0; width:100%; height:100%; cursor:crosshair; }
+
+  #transport {
+    display:flex; align-items:center; gap:10px; margin-top:10px; max-width:940px;
+    background:var(--panel); border:1px solid var(--border); border-radius:9px; padding:6px 10px;
+  }
+  #btnPlay { min-width:38px; text-align:center; }
+  #seek { flex:1; accent-color:var(--accent); }
+  #timeLabel { font-size:12px; color:var(--muted); font-variant-numeric:tabular-nums; min-width:34px; }
+
+  #banner {
+    padding:8px 12px; border-radius:8px; font-size:13px; margin:10px 0; display:none; max-width:940px;
+    font-weight:500;
+  }
+  #banner.look { display:block; background:rgba(46,204,113,0.12); border:1px solid var(--look); color:#bdf5cf; }
+  #banner.away { display:block; background:rgba(231,76,60,0.14); border:1px solid var(--away); color:#ffd3cd; }
+
+  .row { display:flex; gap:18px; margin-top:18px; flex-wrap:wrap; }
+  .panel {
+    flex:1; min-width:300px; background:var(--panel); border:1px solid var(--border);
+    border-radius:12px; padding:16px 18px; box-shadow:0 2px 10px rgba(0,0,0,0.18);
+  }
+  .panel h3 {
+    margin:0 0 12px; font-size:13.5px; color:#aebbdc; text-transform:uppercase;
+    letter-spacing:0.6px; font-weight:700;
+  }
+  .panel label { display:block; font-size:12px; color:var(--muted); margin:10px 0 4px; }
+  .panel input[type=text] {
+    width:100%; padding:8px 10px; background:var(--bg); border:1px solid #333a4a;
+    color:var(--text); border-radius:6px; font-size:13px;
+  }
+  .panel input[type=text]:focus { outline:none; border-color:var(--accent); }
+
+  .hint { margin-top:10px; font-size:12.5px; color:#b7c0d6; line-height:1.7; background:var(--panel2);
+          border:1px solid var(--border); border-radius:8px; padding:10px 12px; }
+  .hint b { color:#fff; }
+
+  #tracks { display:flex; flex-wrap:wrap; gap:7px; margin-top:8px; }
+  .trackBtn {
+    padding:6px 12px 6px 10px; border-radius:16px; font-size:12px; display:flex; align-items:center; gap:6px;
+    border:1px solid #333a4a; background:var(--panel2);
+  }
+  .trackBtn .dot { width:8px; height:8px; border-radius:50%; flex:none; }
+  .trackBtn.sel { background:var(--accent); border-color:var(--accent); color:#fff; }
+  .trackBtn.reviewed:not(.sel) { border-color:#3d4a3d; color:#cdeed9; }
+
+  #timeline { margin-top:12px; font-size:11px; color:var(--muted); }
+  .tlrow { position:relative; height:18px; background:var(--look); border-radius:4px; margin:4px 0;
+           box-shadow:inset 0 0 0 1px rgba(0,0,0,0.15); }
+  .seg { position:absolute; top:0; bottom:0; border-radius:3px; }
+  .seg.away { background:var(--away); }
+
+  #legend { font-size:12.5px; line-height:2; color:#c3cbe0; }
+  #legend b { color:#fff; }
+  .kbd {
+    background:#262c3a; border:1px solid #3c4358; border-radius:5px; padding:2px 7px;
+    font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11.5px; color:#dfe6f5;
+  }
+  #stats { font-size:12px; color:var(--muted); margin-top:8px; }
+
+  .btnrow { margin-top:12px; display:flex; gap:8px; flex-wrap:wrap; }
+
+  #quickProgressBar {
+    margin-top:12px; height:8px; border-radius:5px; background:var(--panel2);
+    border:1px solid var(--border); overflow:hidden;
+  }
+  #quickProgressFill { height:100%; width:0%; background:var(--accent); transition:width 0.15s; }
+  #qBtnLook { border-color:var(--look); color:var(--look); }
+  #qBtnLook:hover { background:rgba(46,204,113,0.12); }
+  #qBtnAway { border-color:var(--away); color:var(--away); }
+  #qBtnAway:hover { background:rgba(231,76,60,0.12); }
+  #qBtnReject { border-color:var(--reject); color:var(--reject); }
+  #qBtnReject:hover { background:rgba(230,126,34,0.12); }
+</style>
+</head>
+<body>
+<header>
+  <div id="logo">VM</div>
+  <div>
+    <h1>VisionMetrics — Video Labeler</h1>
+    <p>1) Drop the video and its matching <code>.json</code> (from <code>prep.py</code>) below → 2) pick a mode below →
+       <b>Quick review</b> is the fastest way to label lots of people: one detected box at a time, <b>L</b>/<b>A</b>/<b>R</b> and it moves on.</p>
+  </div>
+</header>
+
+<div id="drops">
+  <div class="drop" id="dropVideo">🎬 Drag the <b>video file</b> here<br>(or click to choose)</div>
+  <div class="drop" id="dropJson">🗂 Drag the matching <b>.json</b> file here<br>(or click to choose)</div>
+</div>
+<input type="file" id="fileVideo" accept="video/*" hidden>
+<input type="file" id="fileJson" accept=".json" hidden>
+
+<div id="workspace">
+  <div id="modebar">
+    <button id="btnGaze" class="active">1 · Gaze labeling</button>
+    <button id="btnDetect">2 · Detection correction</button>
+    <button id="btnQuick">3 · Quick review</button>
+    <span id="statusText"></span>
+  </div>
+
+  <div id="stage">
+    <video id="vid"></video>
+    <canvas id="overlay"></canvas>
+  </div>
+  <div id="transport">
+    <button id="btnPlay">▶</button>
+    <input type="range" id="seek" min="0" max="1" step="0.001" value="0">
+    <span id="timeLabel">0:00</span>
+  </div>
+  <div id="banner"></div>
+
+  <div class="row">
+    <div class="panel" id="gazePanel">
+      <h3>Gaze labeling</h3>
+      <label>Your name (collector)</label>
+      <input type="text" id="collector" placeholder="e.g. maria">
+      <label>Click a person's box in the video (or here) to select them</label>
+      <div id="tracks"></div>
+      <div class="hint">
+        Everyone is assumed <b style="color:var(--look)">looking</b> by default.
+        Hold <span class="kbd">A</span> only while they're <b>NOT looking</b> — release to stop.
+        Rewind and replay as many times as you like to fix any spot, then click the next person.
+      </div>
+      <div id="timeline"></div>
+      <div class="btnrow">
+        <button id="btnUndoGaze">↺ Undo last mark</button>
+        <button id="btnExportCsv" class="primary">⬇ Download labeled CSV</button>
+      </div>
+      <div id="gazeStats" style="margin-top:8px;font-size:12px;color:var(--muted);"></div>
+    </div>
+
+    <div class="panel" id="detectPanel" style="display:none;">
+      <h3>Detection correction</h3>
+      <div id="legend">
+        <span class="kbd">←</span> / <span class="kbd">→</span> step to previous/next reviewed frame<br>
+        Click a box, then press <span class="kbd">F</span> → toggle <b>not a real person</b> (applies from here onward)<br>
+        Drag on empty space → draw a box for a <b>missed person</b> — it carries forward automatically<br>
+        Drag an existing green box → reposition it here (applies from this frame onward)<br>
+        Select a green box, press <span class="kbd">X</span> → mark that they <b>left the frame</b> here<br>
+        <span class="kbd">Backspace</span> → undo last correction
+      </div>
+      <div id="detectStats" style="margin-top:10px;font-size:12px;color:var(--muted);"></div>
+      <div class="btnrow">
+        <button id="btnUndoDetect">↺ Undo last correction</button>
+        <button id="btnExportJson" class="primary">⬇ Download corrections JSON</button>
+      </div>
+    </div>
+
+    <div class="panel" id="quickPanel" style="display:none;">
+      <h3>Quick review</h3>
+      <div class="hint">
+        One detected box at a time, zoomed in. Judge it and it instantly moves to the next —
+        no scrubbing, no clicking.<br>
+        <span class="kbd">L</span> looking &nbsp; <span class="kbd">A</span> not looking &nbsp;
+        <span class="kbd">R</span> not a real person (reject)<br>
+        <span class="kbd">→</span> skip without labeling &nbsp; <span class="kbd">←</span> go back &nbsp;
+        <span class="kbd">Backspace</span> undo last label
+      </div>
+      <div id="quickProgressBar"><div id="quickProgressFill"></div></div>
+      <div id="quickProgress" style="margin-top:8px;font-size:13px;color:#cdd4e4;"></div>
+      <div class="btnrow">
+        <button id="qBtnAway">A · Not looking</button>
+        <button id="qBtnLook">L · Looking</button>
+        <button id="qBtnReject">R · Reject</button>
+      </div>
+      <div id="quickStats" style="margin-top:10px;font-size:12px;color:var(--muted);"></div>
+      <div class="btnrow">
+        <button id="btnUndoQuick">↺ Undo last label</button>
+        <button id="btnExportQuickCsv" class="primary">⬇ Download quick-review CSV</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const vid = $("vid"), canvas = $("overlay"), ctx = canvas.getContext("2d");
+const clone = (o) => JSON.parse(JSON.stringify(o));
+
+let videoMeta = null, frames = null;   // parsed prep.py JSON
+let videoFile = null;
+let mode = "gaze";
+
+// ---------- gaze state ----------
+// Everyone defaults to "looking"; segments only ever record the spans marked
+// NOT looking (holding A). Nothing else needs to be labeled.
+let activeTrack = null;
+let segments = {};        // trackId -> [{start,end}]  (away spans only)
+let reviewed = new Set(); // trackIds the human actually clicked into at least once
+let marking = null;       // {start} while A is held
+let gazeLog = [];         // undo stack: {trackId, prev}
+
+// ---------- detect state ----------
+// rejectEvents: toggle log for real detections marked "not a real person".
+//   {track_id, fromFrame, state:'reject'|'keep'} — the latest event at/ before
+//   a frame determines whether that track is currently rejected there, so one
+//   press of F applies from that frame all the way forward (no re-pressing
+//   per frame). Press F again later to toggle it back.
+// manualTracks: people the model MISSED. Each has keyframes (frameIndex, box);
+//   the box holds constant (forward-filled) from one keyframe to the next, so
+//   drawing it ONCE keeps it visible on every following frame automatically.
+//   Drag it again on a later frame to reposition (adds a keyframe there);
+//   press X to mark that the person left the frame (stops carrying forward).
+let reviewIdx = 0;
+let rejectEvents = [];
+let manualTracks = [];
+let manualIdCounter = 0;
+let detectLog = [];       // undo stack: {rejectEvents, manualTracks} snapshots
+let selectedBox = null;   // {id, box} — a real detection selected in the current frame
+let selectedManual = null; // {track, box} — a manual track selected in the current frame
+let dragStart = null;
+let dragMode = null;      // "new" | "moveManual"
+
+// ---------- quick-review state ----------
+// One flat queue of every (frame, detected box) pair in the whole video —
+// literally "each box the model found", reviewed one at a time, zoomed in.
+// quickLabels: key "<frameIdx>_<personId>" -> "look" | "away" | "reject".
+let quickQueue = [];
+let quickIdx = 0;
+let quickLabels = {};
+let quickLog = [];        // undo stack: {key, prev}
+let quickBuilt = false;
+
+// ---------- loading ----------
+function wireDrop(dropEl, inputEl, onFile) {
+  dropEl.addEventListener("click", () => inputEl.click());
+  inputEl.addEventListener("change", () => inputEl.files[0] && onFile(inputEl.files[0]));
+  dropEl.addEventListener("dragover", (e) => { e.preventDefault(); dropEl.classList.add("over"); });
+  dropEl.addEventListener("dragleave", () => dropEl.classList.remove("over"));
+  dropEl.addEventListener("drop", (e) => {
+    e.preventDefault(); dropEl.classList.remove("over");
+    const f = e.dataTransfer.files[0]; if (f) onFile(f);
+  });
+}
+
+wireDrop($("dropVideo"), $("fileVideo"), (f) => {
+  videoFile = f;
+  vid.src = URL.createObjectURL(f);
+  $("dropVideo").classList.add("done");
+  $("dropVideo").textContent = "✓ " + f.name;
+  maybeReady();
+});
+
+wireDrop($("dropJson"), $("fileJson"), (f) => {
+  const reader = new FileReader();
+  reader.onload = () => {
+    const data = JSON.parse(reader.result);
+    videoMeta = data.video; frames = data.frames;
+    $("dropJson").classList.add("done");
+    $("dropJson").textContent = "✓ " + f.name + ` (${frames.length} sampled frames)`;
+    maybeReady();
+  };
+  reader.readAsText(f);
+});
+
+function maybeReady() {
+  if (!videoFile || !frames) return;
+  $("workspace").style.display = "block";
+  buildTrackList();
+  vid.addEventListener("loadedmetadata", () => {
+    canvas.width = vid.videoWidth; canvas.height = vid.videoHeight;
+    $("seek").max = vid.duration;
+  });
+  vid.addEventListener("timeupdate", () => {
+    $("seek").value = vid.currentTime;
+    $("timeLabel").textContent = fmtTime(vid.currentTime);
+    draw();
+  });
+}
+
+// ---------- auto-load (generated by prep.py --html, video sits next to this file) ----------
+if (window.__VM_EMBEDDED__) {
+  const emb = window.__VM_EMBEDDED__;
+  videoMeta = emb.video; frames = emb.frames;
+  $("dropJson").classList.add("done");
+  $("dropJson").textContent = `✓ detections auto-loaded (${frames.length} sampled frames)`;
+  videoFile = true;
+  vid.addEventListener("error", () => {
+    $("dropVideo").textContent = "Couldn't auto-find the video next to this page — drag it in here:";
+    $("dropVideo").classList.remove("done");
+  }, { once: true });
+  vid.src = emb.video.filename;
+  $("dropVideo").classList.add("done");
+  $("dropVideo").textContent = "✓ " + emb.video.filename + " (auto-loaded)";
+  maybeReady();
+}
+
+function fmtTime(t) {
+  const m = Math.floor(t / 60), s = Math.floor(t % 60);
+  return `${m}:${String(s).padStart(2, "0")}`;
+}
+
+// ---------- frame lookup ----------
+function nearestFrame(t) {
+  let lo = 0, hi = frames.length - 1;
+  if (hi < 0) return null;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (frames[mid].t < t) lo = mid + 1; else hi = mid;
+  }
+  if (lo > 0 && Math.abs(frames[lo - 1].t - t) < Math.abs(frames[lo].t - t)) lo -= 1;
+  return frames[lo];
+}
+
+function trackColor(id) {
+  const palette = ["#3498db", "#9b59b6", "#f1c40f", "#1abc9c", "#e67e22", "#e84393"];
+  return palette[((id % palette.length) + palette.length) % palette.length];
+}
+
+// ---------- reject toggle helpers (real detections marked as false positives) ----------
+function isRejected(trackId, frameIdx) {
+  let latest = null;
+  for (const e of rejectEvents) {
+    if (e.track_id !== trackId || e.fromFrame > frameIdx) continue;
+    if (!latest || e.fromFrame > latest.fromFrame) latest = e;
+  }
+  return !!latest && latest.state === "reject";
+}
+
+function toggleReject(trackId, frameIdx) {
+  const next = isRejected(trackId, frameIdx) ? "keep" : "reject";
+  rejectEvents.push({ track_id: trackId, fromFrame: frameIdx, state: next });
+}
+
+// ---------- manual (missed-person) track helpers ----------
+function computeManualBoxAt(track, frameIdx) {
+  if (track.endFrame !== null && frameIdx >= track.endFrame) return null;
+  let box = null;
+  for (const k of track.keyframes) {
+    if (k.frameIndex <= frameIdx) box = k.box; else break;
+  }
+  return box;
+}
+
+function manualBoxesAt(frameIdx) {
+  const out = [];
+  for (const track of manualTracks) {
+    const box = computeManualBoxAt(track, frameIdx);
+    if (box) out.push({ track, box });
+  }
+  return out;
+}
+
+function upsertKeyframe(track, frameIndex, box) {
+  const i = track.keyframes.findIndex((k) => k.frameIndex === frameIndex);
+  if (i >= 0) track.keyframes[i].box = box;
+  else { track.keyframes.push({ frameIndex, box }); track.keyframes.sort((a, b) => a.frameIndex - b.frameIndex); }
+}
+
+function pushDetectSnapshot() {
+  detectLog.push({ rejectEvents: clone(rejectEvents), manualTracks: clone(manualTracks) });
+}
+
+function undoDetect() {
+  const snap = detectLog.pop();
+  if (!snap) return;
+  rejectEvents = snap.rejectEvents; manualTracks = snap.manualTracks;
+  selectedBox = null; selectedManual = null;
+  updateDetectStats(); draw();
+}
+
+// ---------- drawing ----------
+function draw() {
+  if (mode === "quick") return; // quick-review mode draws its own zoomed crop, see drawQuickCrop()
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  const f = mode === "detect" ? frames[reviewIdx] : nearestFrame(vid.currentTime);
+  if (!f) return;
+  for (const p of f.people) {
+    const [x1, y1, x2, y2] = p.box;
+    const isActive = mode === "gaze" && p.id === activeTrack;
+    const isSelected = mode === "detect" && selectedBox && selectedBox.id === p.id;
+    const rejected = mode === "detect" && isRejected(p.id, f.i);
+    ctx.lineWidth = isActive || isSelected ? 4 : 2;
+    ctx.strokeStyle = rejected ? "#777" : isSelected ? "#fff" : isActive ? "#fff" : trackColor(p.id);
+    ctx.setLineDash(rejected ? [6, 4] : []);
+    ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+    ctx.setLineDash([]);
+    ctx.fillStyle = "rgba(0,0,0,0.55)";
+    ctx.fillRect(x1, y1 - 18, 46, 18);
+    ctx.fillStyle = "#fff"; ctx.font = "13px monospace";
+    ctx.fillText("#" + p.id, x1 + 4, y1 - 4);
+    if (rejected) {
+      ctx.strokeStyle = "#e74c3c"; ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+      ctx.moveTo(x2, y1); ctx.lineTo(x1, y2); ctx.stroke();
+    }
+  }
+  if (mode === "detect") {
+    for (const { track, box } of manualBoxesAt(f.i)) {
+      const [x1, y1, x2, y2] = box;
+      const isSelected = selectedManual && selectedManual.track === track;
+      ctx.strokeStyle = isSelected ? "#fff" : "#2ecc71";
+      ctx.lineWidth = isSelected ? 4 : 3;
+      ctx.setLineDash([4, 3]);
+      ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+      ctx.setLineDash([]);
+      ctx.fillStyle = "rgba(0,0,0,0.55)";
+      ctx.fillRect(x1, y1 - 18, 56, 18);
+      ctx.fillStyle = "#9be8b3"; ctx.font = "13px monospace";
+      ctx.fillText("#M" + Math.abs(track.id), x1 + 4, y1 - 4);
+    }
+  }
+}
+
+// Merges a newly-marked "away" span into whatever's already there for this
+// track, joining/overlapping spans into one so repeated passes over the same
+// spot don't create duplicate rows on export.
+function addAwaySpan(trackId, newSpan) {
+  const list = segments[trackId] || [];
+  gazeLog.push({ trackId, prev: list.map((s) => ({ ...s })) });
+  const merged = [];
+  let cur = { ...newSpan };
+  for (const s of list) {
+    if (s.end < cur.start || s.start > cur.end) { merged.push(s); continue; }
+    cur.start = Math.min(cur.start, s.start);
+    cur.end = Math.max(cur.end, s.end);
+  }
+  merged.push(cur);
+  merged.sort((a, b) => a.start - b.start);
+  segments[trackId] = merged;
+}
+
+// ---------- track list (gaze mode) ----------
+function buildTrackList() {
+  const ids = new Set();
+  for (const f of frames) for (const p of f.people) ids.add(p.id);
+  const wrap = $("tracks"); wrap.innerHTML = "";
+  [...ids].sort((a, b) => a - b).forEach((id) => {
+    segments[id] = segments[id] || [];
+    const b = document.createElement("button");
+    b.className = "trackBtn";
+    b.innerHTML = `<span class="dot" style="background:${trackColor(id)}"></span>Person #${id}`;
+    b.onclick = () => selectTrack(id);
+    b.dataset.id = id;
+    wrap.appendChild(b);
+  });
+}
+
+function selectTrack(id) {
+  activeTrack = id;
+  reviewed.add(id);
+  [...$("tracks").children].forEach((b) => {
+    const bid = Number(b.dataset.id);
+    b.classList.toggle("sel", bid === id);
+    b.classList.toggle("reviewed", reviewed.has(bid));
+  });
+  renderTimeline();
+}
+
+// ---------- canvas click: select a box (both modes) ----------
+function canvasToNative(e) {
+  const r = canvas.getBoundingClientRect();
+  const sx = canvas.width / r.width, sy = canvas.height / r.height;
+  return [(e.clientX - r.left) * sx, (e.clientY - r.top) * sy];
+}
+
+function hitTest(x, y, peopleList) {
+  let best = null, bestArea = Infinity;
+  for (const p of peopleList) {
+    const [x1, y1, x2, y2] = p.box;
+    if (x >= x1 && x <= x2 && y >= y1 && y <= y2) {
+      const area = (x2 - x1) * (y2 - y1);
+      if (area < bestArea) { best = p; bestArea = area; }
+    }
+  }
+  return best;
+}
+
+function hitTestManual(x, y, frameIdx) {
+  let best = null, bestArea = Infinity;
+  for (const { track, box } of manualBoxesAt(frameIdx)) {
+    const [x1, y1, x2, y2] = box;
+    if (x >= x1 && x <= x2 && y >= y1 && y <= y2) {
+      const area = (x2 - x1) * (y2 - y1);
+      if (area < bestArea) { best = { track, box }; bestArea = area; }
+    }
+  }
+  return best;
+}
+
+canvas.addEventListener("mousedown", (e) => {
+  const [x, y] = canvasToNative(e);
+  if (mode === "gaze") {
+    const f = nearestFrame(vid.currentTime);
+    const hit = f && hitTest(x, y, f.people);
+    if (hit) selectTrack(hit.id);
+    return;
+  }
+  const f = frames[reviewIdx];
+  const manualHit = hitTestManual(x, y, f.i);
+  if (manualHit) {
+    selectedManual = manualHit; selectedBox = null;
+    dragStart = [x, y]; dragMode = "moveManual"; draw();
+    return;
+  }
+  const hit = hitTest(x, y, f.people);
+  if (hit) { selectedBox = hit; selectedManual = null; draw(); return; }
+  selectedBox = null; selectedManual = null;
+  dragStart = [x, y]; dragMode = "new";
+});
+
+canvas.addEventListener("mousemove", (e) => {
+  if (mode !== "detect" || !dragStart) return;
+  const [x, y] = canvasToNative(e);
+  draw();
+  ctx.strokeStyle = "#2ecc71"; ctx.lineWidth = 2; ctx.setLineDash([4, 3]);
+  ctx.strokeRect(dragStart[0], dragStart[1], x - dragStart[0], y - dragStart[1]);
+  ctx.setLineDash([]);
+});
+
+canvas.addEventListener("mouseup", (e) => {
+  if (mode !== "detect" || !dragStart) return;
+  const [x, y] = canvasToNative(e);
+  const [sx, sy] = dragStart; dragStart = null;
+  const dm = dragMode; dragMode = null;
+  if (Math.abs(x - sx) < 6 || Math.abs(y - sy) < 6) return; // too small, treat as a click/select, not a drag
+  const box = [Math.round(Math.min(sx, x)), Math.round(Math.min(sy, y)),
+               Math.round(Math.max(sx, x)), Math.round(Math.max(sy, y))];
+  const frameIdx = frames[reviewIdx].i;
+  pushDetectSnapshot();
+  if (dm === "moveManual" && selectedManual) {
+    upsertKeyframe(selectedManual.track, frameIdx, box);
+    selectedManual = { track: selectedManual.track, box };
+  } else {
+    const track = { id: ++manualIdCounter, keyframes: [{ frameIndex: frameIdx, box }], endFrame: null };
+    manualTracks.push(track);
+    selectedManual = { track, box };
+  }
+  updateDetectStats(); draw();
+});
+
+// ---------- keyboard ----------
+window.addEventListener("keydown", (e) => {
+  if (document.activeElement.tagName === "INPUT") return;
+  if (mode === "gaze") {
+    if (e.key === "a" && !marking && activeTrack !== null) {
+      marking = { start: vid.currentTime };
+      showBanner();
+    }
+  } else if (mode === "detect") {
+    if (e.key === "ArrowRight") { reviewIdx = Math.min(frames.length - 1, reviewIdx + 1); seekReview(); }
+    if (e.key === "ArrowLeft") { reviewIdx = Math.max(0, reviewIdx - 1); seekReview(); }
+    if (e.key.toLowerCase() === "f" && selectedBox) {
+      pushDetectSnapshot();
+      toggleReject(selectedBox.id, frames[reviewIdx].i);
+      updateDetectStats(); draw();
+    }
+    if (e.key.toLowerCase() === "x" && selectedManual) {
+      pushDetectSnapshot();
+      selectedManual.track.endFrame = frames[reviewIdx].i;
+      selectedManual = null;
+      updateDetectStats(); draw();
+    }
+    if (e.key === "Backspace") { undoDetect(); e.preventDefault(); }
+  } else if (mode === "quick") {
+    const k = e.key.toLowerCase();
+    if (k === "l") labelCurrent("look");
+    else if (k === "a") labelCurrent("away");
+    else if (k === "r") labelCurrent("reject");
+    else if (e.key === "ArrowRight") quickNext();
+    else if (e.key === "ArrowLeft") quickPrev();
+    else if (e.key === "Backspace") { undoQuick(); e.preventDefault(); }
+  }
+  if (e.code === "Space" && document.activeElement.tagName !== "BUTTON") {
+    e.preventDefault(); vid.paused ? vid.play() : vid.pause();
+  }
+});
+
+window.addEventListener("keyup", (e) => {
+  if (mode !== "gaze" || !marking || e.key !== "a") return;
+  const span = { start: marking.start, end: vid.currentTime };
+  if (span.end > span.start) addAwaySpan(activeTrack, span);
+  marking = null; hideBanner(); renderTimeline();
+});
+
+function showBanner() {
+  const b = $("banner"); b.className = "away";
+  b.textContent = "🔴 marking NOT LOOKING — person #" + activeTrack;
+}
+function hideBanner() { $("banner").className = ""; }
+
+function seekReview() {
+  vid.pause(); vid.currentTime = frames[reviewIdx].t;
+  updateDetectStats(); draw();
+}
+
+// ---------- timeline (gaze mode) ----------
+// The whole bar is "looking" (green) by default; only the marked-away spans are drawn.
+function renderTimeline() {
+  const wrap = $("timeline"); wrap.innerHTML = "";
+  if (activeTrack === null || !vid.duration) return;
+  const row = document.createElement("div"); row.className = "tlrow";
+  for (const span of segments[activeTrack]) {
+    const d = document.createElement("div");
+    d.className = "seg away";
+    d.style.left = (span.start / vid.duration * 100) + "%";
+    d.style.width = Math.max(0.3, (span.end - span.start) / vid.duration * 100) + "%";
+    row.appendChild(d);
+  }
+  wrap.appendChild(row);
+  const away = segments[activeTrack].reduce((a, s) => a + (s.end - s.start), 0);
+  $("gazeStats").textContent =
+    `Person #${activeTrack}: ${away.toFixed(1)}s marked NOT looking (rest of their time = looking).`;
+}
+
+function updateDetectStats() {
+  $("detectStats").textContent =
+    `Reviewing frame ${reviewIdx + 1}/${frames.length} · ${manualTracks.length} missed-person track(s) added · ` +
+    `${rejectEvents.length} reject toggle(s).`;
+}
+
+// ---------- quick review (one box at a time) ----------
+function buildQuickQueue() {
+  quickQueue = [];
+  for (const f of frames) {
+    for (const p of f.people) {
+      quickQueue.push({ frameIdx: f.i, t: f.t, person: p });
+    }
+  }
+  quickBuilt = true;
+}
+
+function quickKey(item) { return item.frameIdx + "_" + item.person.id; }
+
+function quickShow() {
+  if (!quickQueue.length) { updateQuickStats(); drawQuickPlaceholder(); return; }
+  quickIdx = Math.max(0, Math.min(quickIdx, quickQueue.length - 1));
+  vid.pause();
+  vid.currentTime = quickQueue[quickIdx].t;
+  updateQuickStats();
+}
+
+vid.addEventListener("seeked", () => { if (mode === "quick") drawQuickCrop(); });
+
+function drawQuickPlaceholder() {
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = "#8892a6"; ctx.font = "16px sans-serif";
+  ctx.fillText("No detected people in this video.", 20, 30);
+}
+
+function drawQuickCrop() {
+  if (!quickQueue.length) { drawQuickPlaceholder(); return; }
+  const item = quickQueue[quickIdx];
+  if (!item) return;
+  const [x1, y1, x2, y2] = item.person.box;
+  const bw = Math.max(1, x2 - x1), bh = Math.max(1, y2 - y1);
+  const pad = 0.3;
+  const sx = Math.max(0, x1 - bw * pad), sy = Math.max(0, y1 - bh * pad);
+  const sw = Math.min(canvas.width - sx, bw * (1 + 2 * pad));
+  const sh = Math.min(canvas.height - sy, bh * (1 + 2 * pad));
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, canvas.width, canvas.height);
+  // Fit the cropped region into the canvas preserving aspect ratio (letterboxed).
+  const scale = Math.min(canvas.width / sw, canvas.height / sh);
+  const dw = sw * scale, dh = sh * scale;
+  const dx = (canvas.width - dw) / 2, dy = (canvas.height - dh) / 2;
+  ctx.drawImage(vid, sx, sy, sw, sh, dx, dy, dw, dh);
+
+  ctx.strokeStyle = "#5b8cff"; ctx.lineWidth = 3;
+  ctx.strokeRect(dx + (x1 - sx) * scale, dy + (y1 - sy) * scale, bw * scale, bh * scale);
+
+  const existing = quickLabels[quickKey(item)];
+  if (existing) {
+    const colors = { look: "#2ecc71", away: "#e74c3c", reject: "#e67e22" };
+    const txt = { look: "LOOKING", away: "NOT LOOKING", reject: "REJECTED" }[existing];
+    ctx.fillStyle = colors[existing]; ctx.fillRect(14, 14, 12 + txt.length * 9, 26);
+    ctx.fillStyle = "#0d0f14"; ctx.font = "bold 14px monospace";
+    ctx.fillText(txt, 20, 32);
+  }
+}
+
+function labelCurrent(label) {
+  if (!quickQueue.length) return;
+  const item = quickQueue[quickIdx];
+  const key = quickKey(item);
+  quickLog.push({ key, prev: quickLabels[key] });
+  quickLabels[key] = label;
+  updateQuickStats();
+  if (quickIdx < quickQueue.length - 1) { quickIdx++; quickShow(); } else { drawQuickCrop(); }
+}
+
+function quickNext() { if (quickIdx < quickQueue.length - 1) { quickIdx++; quickShow(); } }
+function quickPrev() { if (quickIdx > 0) { quickIdx--; quickShow(); } }
+
+function undoQuick() {
+  const last = quickLog.pop();
+  if (!last) return;
+  if (last.prev === undefined) delete quickLabels[last.key]; else quickLabels[last.key] = last.prev;
+  updateQuickStats(); drawQuickCrop();
+}
+
+function updateQuickStats() {
+  const total = quickQueue.length;
+  let look = 0, away = 0, reject = 0;
+  for (const k in quickLabels) {
+    if (quickLabels[k] === "look") look++;
+    else if (quickLabels[k] === "away") away++;
+    else if (quickLabels[k] === "reject") reject++;
+  }
+  const done = look + away + reject;
+  $("quickProgressFill").style.width = (total ? (done / total * 100) : 0) + "%";
+  if (!total) { $("quickProgress").textContent = "No detections to review."; $("quickStats").textContent = ""; return; }
+  const item = quickQueue[quickIdx];
+  $("quickProgress").textContent =
+    `Item ${quickIdx + 1} / ${total} · person #${item.person.id}` +
+    (done >= total ? "  —  ✓ all reviewed, you can download the CSV." : "");
+  $("quickStats").textContent =
+    `looking: ${look} · not looking: ${away} · rejected: ${reject} · remaining: ${total - done}`;
+}
+
+// ---------- mode switch ----------
+$("btnGaze").onclick = () => setMode("gaze");
+$("btnDetect").onclick = () => setMode("detect");
+$("btnQuick").onclick = () => setMode("quick");
+function setMode(m) {
+  mode = m;
+  selectedBox = null; selectedManual = null;
+  $("btnGaze").classList.toggle("active", m === "gaze");
+  $("btnDetect").classList.toggle("active", m === "detect");
+  $("btnQuick").classList.toggle("active", m === "quick");
+  $("gazePanel").style.display = m === "gaze" ? "block" : "none";
+  $("detectPanel").style.display = m === "detect" ? "block" : "none";
+  $("quickPanel").style.display = m === "quick" ? "block" : "none";
+  $("transport").style.display = m === "quick" ? "none" : "flex";
+  if (m === "detect") { seekReview(); }
+  else if (m === "quick") { if (!quickBuilt) buildQuickQueue(); quickShow(); }
+  else { draw(); }
+}
+
+// ---------- transport ----------
+$("btnPlay").onclick = () => { vid.paused ? vid.play() : vid.pause(); };
+vid.addEventListener("play", () => $("btnPlay").textContent = "⏸");
+vid.addEventListener("pause", () => $("btnPlay").textContent = "▶");
+$("seek").addEventListener("input", () => { vid.currentTime = Number($("seek").value); });
+
+// ---------- undo ----------
+$("btnUndoGaze").onclick = () => {
+  const last = gazeLog.pop();
+  if (last) { segments[last.trackId] = last.prev; renderTimeline(); }
+};
+$("btnUndoDetect").onclick = () => undoDetect();
+$("btnUndoQuick").onclick = () => undoQuick();
+$("qBtnLook").onclick = () => labelCurrent("look");
+$("qBtnAway").onclick = () => labelCurrent("away");
+$("qBtnReject").onclick = () => labelCurrent("reject");
+
+// ---------- export ----------
+function tierFor(d) {
+  if (d >= 0.25) return "near <0.5m";
+  if (d >= 0.10) return "mid 0.5-1.5m";
+  if (d >= 0.04) return "far 1.5-3.5m";
+  return "v-far >3.5m";
+}
+
+$("btnExportCsv").onclick = () => {
+  const cols = ["yaw", "pitch", "distance", "label", "distance_tier", "glasses", "headwear",
+                "subject", "collector", "session", "captured_at"];
+  const rows = [cols.join(",")];
+  const collector = $("collector").value || "unknown";
+  const session = (videoMeta.filename || "session") + "_" + Date.now();
+  const capturedAt = new Date().toISOString();
+  // Only export people you actually clicked into — anyone never selected simply
+  // hasn't been reviewed yet, and isn't assumed to be anything.
+  for (const trackId of reviewed) {
+    const away = segments[trackId] || [];
+    for (const f of frames) {
+      const p = f.people.find((pp) => pp.id === Number(trackId));
+      if (!p || p.yaw === undefined) continue;
+      const isAway = away.some((s) => f.t >= s.start && f.t <= s.end);
+      const label = isAway ? 0 : 1;
+      rows.push([p.yaw, p.pitch, p.distance, label, p.tier || tierFor(p.distance),
+                 "unknown", "unknown", "unknown", collector, session, capturedAt].join(","));
+    }
+  }
+  downloadText(rows.join("\n"), (videoMeta.filename || "session") + "_gaze.csv");
+};
+
+$("btnExportQuickCsv").onclick = () => {
+  const cols = ["yaw", "pitch", "distance", "label", "distance_tier", "glasses", "headwear",
+                "subject", "collector", "session", "captured_at"];
+  const rows = [cols.join(",")];
+  const collector = $("collector").value || "unknown";
+  const session = (videoMeta.filename || "session") + "_quick_" + Date.now();
+  const capturedAt = new Date().toISOString();
+  for (const item of quickQueue) {
+    const lab = quickLabels[quickKey(item)];
+    if (!lab || lab === "reject") continue;  // unreviewed, or flagged as not a real person
+    const p = item.person;
+    if (p.yaw === undefined) continue;
+    const label = lab === "look" ? 1 : 0;
+    rows.push([p.yaw, p.pitch, p.distance, label, p.tier || tierFor(p.distance),
+               "unknown", "unknown", "unknown", collector, session, capturedAt].join(","));
+  }
+  downloadText(rows.join("\n"), (videoMeta.filename || "session") + "_quickreview.csv");
+};
+
+$("btnExportJson").onclick = () => {
+  // manual_tracks / reject_events are kept as keyframes + toggle events (not
+  // expanded per-frame) so a training script can forward-fill them the same
+  // way this page does — see computeManualBoxAt() / isRejected() above.
+  const out = { video: videoMeta.filename, reject_events: rejectEvents, manual_tracks: manualTracks };
+  downloadText(JSON.stringify(out, null, 2), (videoMeta.filename || "session") + "_corrections.json");
+};
+
+function downloadText(text, filename) {
+  const blob = new Blob([text], { type: "text/plain" });
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = filename; a.click();
+}
+</script>
+</body>
+</html>

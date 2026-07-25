@@ -1,0 +1,1 @@
+{"kind": "session_eval", "n": 9, "pos": 3, "neg": 6, "auc": 0.9444, "ap": 0.9167, "brier": 0.2018, "f1": 0.6667, "accuracy": 0.7778, "at": "2026-07-25T11:48:37", "session": "live_20260725-114521", "store_name": "Demo VisionMetrics"}

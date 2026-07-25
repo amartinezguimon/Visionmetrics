@@ -28,6 +28,7 @@ class PersonResult:
     yaw: float | None = None
     pitch: float | None = None
     dist_m: float | None = None
+    distance: float | None = None  # normalised cheekbone width — training.collect.tier_for() input
     engage_prob: float = 0.0
     zone_conf: float = 1.0
     torso_conf: float = 1.0
@@ -43,6 +44,10 @@ class PersonResult:
 class FrameResult:
     persons: list[PersonResult] = field(default_factory=list)
     active_ids: set[int] = field(default_factory=set)
+    # EVERY detector box this frame, before any zone/size/debounce/passerby
+    # gating below — lets a reviewer audit the raw detector, including boxes
+    # that never make it into `persons` (e.g. rejected as furniture/posters).
+    raw_boxes: list[dict] = field(default_factory=list)
 
 
 def _tier(prob: float) -> str:
@@ -90,10 +95,22 @@ class EngagementPipeline:
         self._focal_px: float | None = None
         self._seen: dict[int, int] = {}            # canonical id -> frames seen
         self._first_center: dict[int, tuple[float, float]] = {}  # bbox centre when first seen
+        self._last_center: dict[int, tuple[float, float]] = {}   # bbox centre most recently seen
         self._moved: set[int] = set()              # canonical ids that have moved enough
         self._face_seen: set[int] = set()          # canonical ids that have shown a face
         self._passerby: set[int] = set()           # canonical ids confirmed as real people
         self._seen_outside: set[int] = set()       # canonical ids seen OUTSIDE the zone (for entry counting)
+        self._engaged_ever: set[int] = set()       # canonical ids that engaged at least once
+        # Which way foot traffic flows past the window, resolved once per track
+        # when it departs (net horizontal displacement of its trajectory). Purely
+        # anonymous: a direction sign, never a path or identity. "left"/"right" is
+        # the side the person CAME FROM in camera space; the operator can name the
+        # sides in device.yaml. `engaged` counts those who also stopped to look.
+        self.flow: dict[str, int] = {
+            "from_left": 0, "from_right": 0,
+            "from_left_engaged": 0, "from_right_engaged": 0,
+            "ambiguous": 0,
+        }
 
     def process_frame(self, frame, frame_idx: int, now: float) -> FrameResult:
         if self._focal_px is None:
@@ -108,6 +125,9 @@ class EngagementPipeline:
         for det, tid in zip(dets, canon):
             x1, y1, x2, y2 = det.bbox
             cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+            result.raw_boxes.append({
+                "id": tid, "box": [x1, y1, x2, y2], "conf": round(det.confidence, 3),
+            })
 
             # Inside the counting zone? (feet = bbox bottom-centre). With no zone
             # calibrated, everyone is "inside" (legacy behaviour).
@@ -131,8 +151,10 @@ class EngagementPipeline:
             seen = self._seen[tid] = self._seen.get(tid, 0) + 1
 
             # Track movement since first seen (cheap, every frame): a real person
-            # walks; furniture doesn't.
+            # walks; furniture doesn't. Also remember the latest centre so the
+            # departure hook can resolve the track's net direction of travel.
             fx, fy = self._first_center.setdefault(tid, (cx, cy))
+            self._last_center[tid] = (cx, cy)
             if (cx - fx) ** 2 + (cy - fy) ** 2 >= self.passerby_motion_px ** 2:
                 self._moved.add(tid)
 
@@ -166,23 +188,52 @@ class EngagementPipeline:
 
             result.active_ids.add(tid)
             torso = self.torso.analyze(frame, det.bbox, tid, frame_idx)
-            result.persons.append(self._score(tid, det.bbox, pose, torso, now))
+            person = self._score(tid, det.bbox, pose, torso, now)
+            if person.is_engaged or person.total_engage_s > 0.0:
+                self._engaged_ever.add(tid)
+            result.persons.append(person)
 
         # Forget tracks gone past the grace window: free their per-track state
         # everywhere. drop() banks a real person's attention into the session
         # total first, so counts/attention are preserved while memory is freed.
         for cid in self.reconciler.expire(frame_idx):
+            self._tally_flow(cid)
             self.tracker.drop(cid)
             self.head_pose.forget(cid)
             self.torso.forget(cid)
             self._seen.pop(cid, None)
             self._first_center.pop(cid, None)
+            self._last_center.pop(cid, None)
             self._moved.discard(cid)
             self._face_seen.discard(cid)
             self._passerby.discard(cid)
             self._seen_outside.discard(cid)
+            self._engaged_ever.discard(cid)
 
         return result
+
+    def _tally_flow(self, cid: int) -> None:
+        """When a confirmed passer-by departs, bank which side they came from
+        into `self.flow`, from the net horizontal shift of their trajectory.
+        Only real people are counted (same gate as `total_passersby`); a track
+        that barely moved horizontally is 'ambiguous' rather than mis-attributed."""
+        if cid not in self._passerby:
+            return
+        first = self._first_center.get(cid)
+        last = self._last_center.get(cid)
+        if first is None or last is None:
+            return
+        dx = last[0] - first[0]
+        if abs(dx) < self.passerby_motion_px:
+            self.flow["ambiguous"] += 1
+            return
+        engaged = cid in self._engaged_ever
+        # Moving right (dx>0) means they entered from the left of frame, and vice
+        # versa — so the side they CAME FROM is the sign's opposite in space.
+        side = "from_left" if dx > 0 else "from_right"
+        self.flow[side] += 1
+        if engaged:
+            self.flow[f"{side}_engaged"] += 1
 
     # ── scoring ──────────────────────────────────────────────────
     def _score(self, tid, bbox, pose, torso, now) -> PersonResult:
@@ -208,6 +259,7 @@ class EngagementPipeline:
             engage_prob = prob * zone_conf
             raw_engaged = engage_prob >= ENGAGE_THRESHOLD
             person.yaw, person.pitch, person.dist_m = pose.yaw, pose.pitch, pose.dist_m
+            person.distance = pose.distance
             person.nose_px = pose.nose_px
 
         update = self.tracker.update(tid, raw_engaged, now, prob=engage_prob)

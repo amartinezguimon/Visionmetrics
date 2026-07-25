@@ -39,10 +39,9 @@ export default function LoginPage() {
         </div>
 
         <form onSubmit={onSubmit} className="rounded-card bg-card p-7 shadow-sm">
-          <h1 className="mb-1 text-[18px] font-bold text-dark">Inicia sesión</h1>
-          <p className="mb-5 text-[12px] text-gray3">Accede al panel de tu tienda.</p>
+          <h1 className="mb-5 text-[18px] font-semibold text-dark">Inicia sesión</h1>
 
-          <label className="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-slate">
+          <label className="mb-1 block text-[12px] font-medium text-slate">
             Correo
           </label>
           <input
@@ -55,7 +54,7 @@ export default function LoginPage() {
             placeholder="tu@correo.com"
           />
 
-          <label className="mb-1 block text-[11px] font-semibold uppercase tracking-wide text-slate">
+          <label className="mb-1 block text-[12px] font-medium text-slate">
             Contraseña
           </label>
           <input
@@ -83,10 +82,7 @@ export default function LoginPage() {
           </button>
         </form>
 
-        <p className="mt-4 text-center text-[11px] text-gray3">
-          ¿Problemas para entrar? Contacta con VisionMetrics.
-        </p>
-        <p className="mt-1 text-center text-[11px]">
+        <p className="mt-4 text-center text-[11px]">
           <a href="/staff/login" className="text-gray4 hover:text-purple">
             Acceso del equipo
           </a>

@@ -13,8 +13,10 @@ interface Props {
 
 const navClass = ({ isActive }: { isActive: boolean }) =>
   [
-    "rounded-[24px] px-[18px] py-[7px] text-[13px] cursor-pointer transition-colors",
-    isActive ? "bg-purple font-medium text-white" : "text-gray2 hover:text-dark",
+    "rounded-[24px] px-[18px] py-[7px] text-[13px] cursor-pointer",
+    isActive
+      ? "bg-purple font-medium text-white shadow-[0_2px_12px_rgba(61,26,110,0.28)]"
+      : "text-gray2 hover:text-dark hover:bg-gray6",
   ].join(" ");
 
 export default function TopBar({
@@ -27,7 +29,7 @@ export default function TopBar({
 }: Props) {
   return (
     <div className="mb-6 flex items-center justify-between">
-      <div className="rounded-[30px] bg-purple px-5 py-2 text-[15px] font-bold text-white">
+      <div className="rounded-[30px] bg-purple px-5 py-2 text-[15px] font-bold text-white shadow-[0_4px_16px_rgba(61,26,110,0.28)] transition-transform hover:-translate-y-0.5">
         VisionMetrics
       </div>
 
@@ -69,7 +71,7 @@ export default function TopBar({
         <button
           onClick={onLogout}
           title={`${storeName} — cerrar sesión`}
-          className="flex h-[34px] w-[34px] items-center justify-center rounded-full bg-purple text-[12px] font-semibold text-white transition hover:opacity-90"
+          className="flex h-[34px] w-[34px] items-center justify-center rounded-full bg-purple text-[12px] font-semibold text-white transition hover:-translate-y-0.5 hover:shadow-[0_6px_16px_rgba(61,26,110,0.30)]"
         >
           {initials(storeName)}
         </button>

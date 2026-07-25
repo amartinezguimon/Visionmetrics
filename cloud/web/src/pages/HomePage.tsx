@@ -70,12 +70,7 @@ export default function HomePage() {
         {/* HERO CHART */}
         <div className="flex flex-col rounded-card bg-card p-[22px]">
           <div className="mb-[18px] flex shrink-0 items-start justify-between">
-            <div>
-              <div className="mb-[5px] text-[10px] font-semibold uppercase tracking-[0.07em] text-slate">
-                {heroLabel}
-              </div>
-              <div className="text-[18px] font-bold -tracking-[0.3px]">Personas por hora</div>
-            </div>
+            <div className="text-[17px] font-semibold -tracking-[0.3px]">{heroLabel}</div>
             <div className="flex gap-4">
               <Legend color="#D8D8D8">Pasaron</Legend>
               <Legend color="var(--purple)">Miraron +2s</Legend>
@@ -123,13 +118,8 @@ export default function HomePage() {
       {/* MONTHLY CHART */}
       <div className="rounded-card bg-card p-[22px]">
         <div className="mb-1.5 flex items-start justify-between">
-          <div>
-            <div className="mb-[5px] text-[10px] font-semibold uppercase tracking-[0.07em] text-slate">
-              Resumen mensual
-            </div>
-            <div className="text-[16px] font-bold">
-              {MONTHS[viewMonth0]} {viewYear} — cada día
-            </div>
+          <div className="text-[16px] font-semibold -tracking-[0.2px]">
+            {MONTHS[viewMonth0]} {viewYear}
           </div>
           <div className="flex gap-[18px]">
             <LineLegend color="#1C1C1C">Media pasando</LineLegend>
@@ -220,11 +210,8 @@ function EmptyHint({
         <div className="text-[12px] text-danger">{error}</div>
       ) : (
         <>
-          <div className="text-[13px] font-semibold text-gray3">
+          <div className="text-[13px] font-medium text-gray3">
             Aún no hay datos de {month} {year}
-          </div>
-          <div className="max-w-[300px] text-[11px] text-gray4">
-            En cuanto la cámara empiece a medir, los datos aparecerán aquí automáticamente.
           </div>
         </>
       )}

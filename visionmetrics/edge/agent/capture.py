@@ -60,13 +60,16 @@ def _is_realtime(source) -> bool:
 
 
 class VideoSource:
-    def __init__(self, source, *, reconnect_delay_s: float = 2.0):
+    def __init__(self, source, *, reconnect_delay_s: float = 2.0, loop: bool = False):
         # "1" (string) from a CLI/config still means webcam index 1.
         if isinstance(source, str) and source.isdigit():
             source = int(source)
         self.source = source
         self.reconnect_delay_s = reconnect_delay_s
         self.realtime = _is_realtime(source)
+        # Replay a file source from the start on EOF instead of ending — only
+        # meaningful for non-realtime (file) sources; used for demos/previews.
+        self.loop = loop and not self.realtime
         self._cap: cv2.VideoCapture | None = None
         self._frame = None
         self._ok = False
@@ -75,8 +78,8 @@ class VideoSource:
         self._thread: threading.Thread | None = None
 
     @classmethod
-    def from_config(cls, camera_cfg) -> "VideoSource":
-        return cls(camera_cfg.source, reconnect_delay_s=camera_cfg.reconnect_delay_s)
+    def from_config(cls, camera_cfg, *, loop: bool = False) -> "VideoSource":
+        return cls(camera_cfg.source, reconnect_delay_s=camera_cfg.reconnect_delay_s, loop=loop)
 
     # ── lifecycle ────────────────────────────────────────────────
     def open(self) -> bool:
@@ -95,6 +98,9 @@ class VideoSource:
             with self._lock:
                 return self._ok, (self._frame.copy() if self._frame is not None else None)
         ok, frame = self._cap.read()
+        if not ok and self.loop and self._cap is not None:
+            self._cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ok, frame = self._cap.read()
         return ok, frame
 
     def release(self) -> None:

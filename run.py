@@ -53,13 +53,30 @@ def _run(args: list[str], env: dict | None = None) -> None:
 
 
 _cam = {"idx": None}
+CAMERA_PREF_FILE = ROOT / "configs" / "camera_pref.txt"
 
 
 def _camera() -> str:
-    """Ask once which camera number to use (cached for the session)."""
-    if _cam["idx"] is None:
-        v = input("  ¿Número de cámara? (Enter = 0; usa 'Ver cámaras' si no sabes): ").strip()
-        _cam["idx"] = v if v else "0"
+    """Which camera number to use. Remembered across runs once you pick one,
+    so you don't have to type it in every time (e.g. your phone via Camo)."""
+    if _cam["idx"] is not None:
+        return _cam["idx"]
+
+    if CAMERA_PREF_FILE.exists():
+        saved = CAMERA_PREF_FILE.read_text(encoding="utf-8").strip()
+        if saved:
+            print(f"  Usando la cámara guardada: {saved}  "
+                  f"(para cambiarla, borra {CAMERA_PREF_FILE.relative_to(ROOT)})")
+            _cam["idx"] = saved
+            return saved
+
+    v = input("  ¿Número de cámara? (Enter = 0; usa 'Ver cámaras' si no sabes): ").strip()
+    _cam["idx"] = v if v else "0"
+    try:
+        CAMERA_PREF_FILE.parent.mkdir(parents=True, exist_ok=True)
+        CAMERA_PREF_FILE.write_text(_cam["idx"], encoding="utf-8")
+    except Exception:
+        pass  # not critical if we can't save the preference
     return _cam["idx"]
 
 
@@ -87,12 +104,19 @@ def _probar_en_vivo() -> None:
     (ROOT / "results").mkdir(exist_ok=True)
     stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
     report = f"results/demo_{stamp}.json"
-    print("\n  Se abrirá una ventana con la cámara y los datos en directo.")
-    print("  Pulsa Q en la ventana para terminar.")
-    _run(["-m", "visionmetrics.edge.agent.service",
-          "--config", "configs/demo.yaml", "--debug", "--report", report, "--source", _camera()])
+    print("\n  Se abrirá tu navegador con la cámara y los datos en directo.")
+    print("  Pulsa 'Detener sesión' en la página cuando termines.")
+    _run(["-m", "visionmetrics.edge.agent.webserver",
+          "--config", "configs/demo.yaml", "--report", report, "--source", _camera()])
     print("\n  *** LISTO. Envíale a Álvaro este archivo (WhatsApp / email): ***")
     print(f"      {ROOT / report}")
+
+    video = (ROOT / report).with_suffix(".mp4")
+    if video.exists() and _yes("\n  La sesión quedó grabada. ¿Quieres etiquetarla ahora?"):
+        print("\n  Analizando el vídeo (detectando personas + mirada)... puede tardar varios minutos.")
+        _run(["-m", "visionmetrics.training.prep", str(video)])
+        print("\n  *** Se habrá abierto el navegador para etiquetar/corregir. ***")
+        print("  *** Cuando acabes, pulsa 'Descargar CSV etiquetado' y mándamelo (WhatsApp / email). ***")
 
 
 def demo_guiada() -> None:
@@ -121,31 +145,61 @@ def grabar_datos() -> None:
 
 
 def ver_camaras() -> None:
-    _run(["visionmetrics/edge/tools/check_cameras.py"])
+    print("\n  Se abrirá el navegador con una foto de cada cámara conectada.")
+    print("  Haz clic en la que sea tu móvil — se guarda sola, no hay que escribir nada.")
+    _run(["-m", "visionmetrics.edge.tools.camera_picker"])
+    _cam["idx"] = None  # forzar a releer configs/camera_pref.txt (se acaba de actualizar)
+
+
+def importar_y_etiquetar() -> None:
+    """Import a recorded video, run the real detector over it, and open the
+    browser labeler with everything already loaded — no extra Python needed."""
+    ruta = input("\n  Ruta del vídeo a importar (arrástralo aquí y pulsa Enter): ").strip().strip('"')
+    if not ruta:
+        print("  (cancelado, no se dio ninguna ruta)")
+        return
+    if not Path(ruta).exists():
+        print(f"  No encuentro el archivo: {ruta}")
+        return
+    print("\n  Analizando el vídeo (detectando personas + mirada)... puede tardar varios minutos.")
+    _run(["-m", "visionmetrics.training.prep", ruta])
+    print("\n  *** Se habrá abierto el navegador para etiquetar/corregir. ***")
+    print("  *** Cuando acabes, pulsa 'Descargar CSV etiquetado' y mándamelo (WhatsApp / email). ***")
+
+
+def etiquetar_ultima_grabacion() -> None:
+    """No path to type: grabs whichever recording (results/ or recordings/) is
+    newest and opens it straight in the labeler — the direct follow-up to
+    stopping a live session without going through the menu that ran it."""
+    print("\n  Buscando tu grabación más reciente...")
+    _run(["-m", "visionmetrics.training.label_latest"])
+    print("\n  *** Se habrá abierto el navegador para etiquetar/corregir. ***")
+    print("  *** Cuando acabes, pulsa 'Descargar CSV etiquetado' y mándamelo (WhatsApp / email). ***")
 
 
 MENU = {
-    "1": ("DEMO guiada: calibrar → zona → probar en vivo", demo_guiada),
-    "2": ("Grabar datos para entrenar (y enviármelos)", grabar_datos),
-    "3": ("Solo: dibujar la zona de conteo", _dibujar_zona),
-    "4": ("Solo: calibrar el escaparate", _calibrar),
-    "5": ("Ver qué cámaras hay (si la cámara no abre)", ver_camaras),
+    "1": ("Probar en vivo", demo_guiada),
+    "2": ("Grabar datos", grabar_datos),
+    "3": ("Dibujar zona", _dibujar_zona),
+    "4": ("Calibrar escaparate", _calibrar),
+    "5": ("Elegir cámara", ver_camaras),
+    "6": ("Importar vídeo", importar_y_etiquetar),
+    "7": ("Etiquetar última grabación", etiquetar_ultima_grabacion),
 }
 
 
 def main() -> int:
-    print("\n=== VisionMetrics — demo ===")
     if not _check_deps():
-        input("\n  (pulsa Enter para salir) ")
+        input("\n  Enter para salir  ")
         return 1
     while True:
-        print("\n----------------  MENÚ  ----------------")
+        print("\n  VisionMetrics\n")
         for key, (label, _) in MENU.items():
-            print(f"  {key}) {label}")
-        print("  0) Salir")
-        choice = input("  Elige una opción: ").strip()
+            print(f"    {key}   {label}")
+        print(f"    0   Salir")
+        choice = input("\n  ›  ").strip()
         if choice == "0":
-            print("  ¡Hasta luego!")
+            print("\n  Hasta luego.\n")
             return 0
         item = MENU.get(choice)
         if not item:
