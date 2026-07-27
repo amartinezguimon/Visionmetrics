@@ -1007,12 +1007,27 @@ def _run_one_session(config, state: "_SharedState", *, report_path: str | None,
     if vsource.realtime:
         print("[web] esperando imagen de la cámara…")
         t_wait = time.time()
-        while time.time() - t_wait < 12.0:
+        got_image = False
+        # 20s, not 12s: a Continuity Camera (iPhone) can take many seconds to
+        # physically wake the first time it's used after a cold launch.
+        while time.time() - t_wait < 20.0:
             ok, f = vsource.read()
             if ok and f is not None and float(f.mean()) >= 8:
                 print("[web] imagen recibida.")
+                got_image = True
                 break
             time.sleep(0.3)
+        if not got_image:
+            print(
+                "[web] AVISO: la cámara abrió pero solo entrega imagen negra.\n"
+                "      Causas habituales (macOS):\n"
+                "        1) Permiso de cámara: System Settings > Privacy & Security >\n"
+                "           Camera → activa Terminal (y reinicia esta ventana).\n"
+                "        2) Cámara de Continuidad (iPhone) dormida: desbloquea el\n"
+                "           iPhone y déjalo cerca; o desactívala para usar la cámara\n"
+                "           integrada del Mac.\n"
+                "      El programa seguirá; la imagen aparecerá en cuanto la cámara despierte."
+            )
 
     # ---- fresh per-session state (wipes the previous session cleanly) ----
     # Every look/away label the operator makes in review is persisted live, in
@@ -1271,9 +1286,11 @@ def run(config_path: str, *, debug: bool = False, report_path: str | None = None
     if isinstance(config.camera.source, int):
         picked = pick_working_camera(config.camera.source)
         if picked is None:
-            print("[web] WARNING: no camera produced an image on indices 0-2. Check the "
-                  "camera is connected and that this app has camera permission "
-                  "(macOS: System Settings > Privacy & Security > Camera).")
+            print("[web] AVISO: ninguna cámara entregó imagen en los índices 0-2.\n"
+                  "      1) Permiso de cámara: System Settings > Privacy & Security >\n"
+                  "         Camera → activa Terminal, luego cierra y reabre esta ventana.\n"
+                  "      2) Si usas la cámara de Continuidad (iPhone), desbloquéalo y\n"
+                  "         déjalo cerca; o desactívala para usar la cámara del Mac.")
         elif picked != config.camera.source:
             print(f"[web] camera index {config.camera.source} produced no image; "
                   f"using the working camera at index {picked} instead.")

@@ -66,26 +66,44 @@ def _probe_camera(index: int, warm_secs: float = 1.2) -> tuple[bool, bool]:
 
 
 def pick_working_camera(preferred: int = 0, max_index: int = 3,
-                        warm_secs: float = 1.2):
+                        warm_secs: float = 1.5, slow_warm_secs: float = 6.0):
     """Choose a webcam index that actually produces an image, so the app works on
     a machine we've never seen — a Mac's index 0 is often an absent/black
     Continuity Camera while the real webcam is 1 or 2, so hard-coding 0 shows a
     black feed on someone else's laptop. Tries `preferred` first, then 0..max_index-1.
-    Returns the first index that delivers a real frame; if none delivers, the first
-    that at least opened (so the caller's own warm-up/error path still runs); or
-    None if nothing opened at all."""
+
+    Two passes, because a Continuity Camera (iPhone) can take several seconds to
+    physically wake — far longer than a built-in FaceTime cam. A short first pass
+    keeps startup snappy when a normal webcam is present; only if nothing delivers
+    quickly do we go back and give each *opened* index a long warm-up, so a slow
+    iPhone camera still gets picked instead of showing a black rectangle.
+
+    Returns the first index that delivers a real frame; if none delivers even after
+    the slow pass, the first that at least opened (so the caller's own warm-up/error
+    path still runs); or None if nothing opened at all."""
     order: list[int] = []
     for idx in [preferred, *range(max_index)]:
         if idx not in order:
             order.append(idx)
-    opened_fallback = None
+
+    # Pass 1 — quick probe. Remember which indices at least opened (a backend
+    # accepted them) so we can revisit them with patience if none delivered fast.
+    opened_indices: list[int] = []
     for idx in order:
         opened, delivers = _probe_camera(idx, warm_secs)
         if delivers:
             return idx
-        if opened and opened_fallback is None:
-            opened_fallback = idx
-    return opened_fallback
+        if opened:
+            opened_indices.append(idx)
+
+    # Pass 2 — patient warm-up for a slow-waking camera (Continuity Camera).
+    for idx in opened_indices:
+        if _probe_camera(idx, slow_warm_secs)[1]:
+            return idx
+
+    # Nothing produced a real image; hand back the first that at least opened so
+    # the caller keeps waiting on it (it may wake up even later), or None.
+    return opened_indices[0] if opened_indices else None
 
 
 def _is_realtime(source) -> bool:
@@ -162,14 +180,33 @@ class VideoSource:
 
     # ── background pump (realtime only) ──────────────────────────
     def _pump(self) -> None:
+        # A realtime camera — especially an iPhone Continuity Camera — returns the
+        # odd empty read (ok=False / frame=None) without actually being gone. The
+        # first version tore the capture down and reopened it on the VERY FIRST
+        # miss, which made such cameras "flap": image for a second, then it drops,
+        # reconnects, drops again… To the user the camera "connects and then
+        # disconnects" on a loop. So tolerate a short burst of misses (keep serving
+        # the last good frame) and only truly reconnect after they persist.
+        first_fail: float | None = None
         while not self._stop.is_set():
             if self._cap is None or not self._cap.isOpened():
                 self._reconnect()
+                first_fail = None
                 continue
             ok, frame = self._cap.read()
-            if not ok:
-                self._reconnect()
+            if not ok or frame is None:
+                now = time.time()
+                if first_fail is None:
+                    first_fail = now
+                elif now - first_fail >= 2.0:
+                    # Misses have persisted ~2s: the camera really dropped, so do a
+                    # full reconnect (release + reopen after reconnect_delay_s).
+                    self._reconnect()
+                    first_fail = None
+                    continue
+                time.sleep(0.02)  # brief hiccup: wait a beat, keep the last frame
                 continue
+            first_fail = None
             with self._lock:
                 self._ok, self._frame = ok, frame
 
