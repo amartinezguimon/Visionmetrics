@@ -1,12 +1,14 @@
 #!/bin/bash
 # ============================================================
 #  VisionMetrics — lanzador de doble clic (vista en vivo)
-#  Doble clic sobre este archivo para abrir la cámara en directo.
+#  Portátil: funciona desde cualquier carpeta y en cualquier Mac.
+#  La PRIMERA vez crea el entorno e instala las dependencias solo.
 #  Al lanzarse desde tu Terminal, macOS le concede permiso de cámara.
 # ============================================================
 
-cd "$HOME/Desktop/AI-AD-main" || {
-  echo "  No encuentro la carpeta ~/Desktop/AI-AD-main"
+# Ir SIEMPRE a la carpeta de este archivo (no a una ruta fija) → portátil.
+cd "$(dirname "$0")" || {
+  echo "  No pude entrar en la carpeta del programa."
   read -n 1 -s -r -p "  Pulsa una tecla para cerrar…"
   exit 1
 }
@@ -17,14 +19,39 @@ echo "  VisionMetrics — arrancando la vista en vivo…"
 echo "  (se abrirá solo en el navegador; deja esta ventana abierta)"
 echo ""
 
-if [ ! -x "venv/bin/python" ]; then
-  echo "  No encuentro venv/bin/python en $(pwd)."
-  echo "  Falta el entorno virtual (venv). Créalo antes de usar este lanzador."
+# --- ¿Hay Python 3? ---
+if ! command -v python3 >/dev/null 2>&1; then
+  echo "  No encuentro Python 3 en este ordenador."
+  echo "  Instálalo desde https://www.python.org/downloads/ y vuelve a abrir este archivo."
   echo ""
   read -n 1 -s -r -p "  Pulsa una tecla para cerrar…"
   exit 1
 fi
 
+# --- Primera vez: crear el entorno virtual e instalar dependencias ---
+if [ ! -x "venv/bin/python" ]; then
+  echo "  Primera vez en este ordenador: preparando el entorno."
+  echo "  (esto descarga las librerías; puede tardar varios minutos)"
+  echo ""
+  python3 -m venv venv || {
+    echo "  No pude crear el entorno virtual (venv)."
+    read -n 1 -s -r -p "  Pulsa una tecla para cerrar…"
+    exit 1
+  }
+  venv/bin/python -m pip install --upgrade pip >/dev/null 2>&1
+  if ! venv/bin/python -m pip install -r requirements.txt; then
+    echo ""
+    echo "  Fallo instalando las dependencias. Revisa tu conexión e inténtalo de nuevo."
+    read -n 1 -s -r -p "  Pulsa una tecla para cerrar…"
+    exit 1
+  fi
+  echo ""
+  echo "  Entorno listo."
+  echo ""
+fi
+
+# Al arrancar, el programa descarga los modelos que falten (MediaPipe + YOLO)
+# automáticamente y elige una cámara que dé imagen real (da igual el índice).
 export PYTHONUTF8=1
 venv/bin/python -m visionmetrics.edge.agent.webserver --config configs/demo.yaml --source 0
 

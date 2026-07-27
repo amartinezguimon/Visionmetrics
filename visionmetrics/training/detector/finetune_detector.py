@@ -92,7 +92,18 @@ def main() -> int:
         train_kwargs["device"] = a.device
     model.train(**train_kwargs)
 
-    best = Path(a.project) / a.name / "weights" / "best.pt"
+    # Ask the trainer where it ACTUALLY saved, don't guess. Ultralytics resolves a
+    # relative `project` under its global runs_dir (settings.yaml), so the run can
+    # land at e.g. ~/AI-AD/runs/detector/finetune instead of ./runs/detector/finetune.
+    # The old code assumed the CWD-relative path and reported best.pt "missing"
+    # whenever a global runs_dir was set — even though training fully succeeded.
+    save_dir = Path(getattr(getattr(model, "trainer", None), "save_dir", "")
+                    or (Path(a.project) / a.name))
+    best = save_dir / "weights" / "best.pt"
+    if not best.exists():
+        alt = Path(a.project) / a.name / "weights" / "best.pt"  # legacy fallback
+        if alt.exists():
+            best = alt
     if not best.exists():
         print(f"[finetune] training finished but {best} is missing — check the run output above.")
         return 1

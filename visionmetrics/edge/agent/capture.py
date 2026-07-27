@@ -51,6 +51,43 @@ def open_capture(source):
     return cv2.VideoCapture(source)
 
 
+def _probe_camera(index: int, warm_secs: float = 1.2) -> tuple[bool, bool]:
+    """Probe a webcam index → (opened, delivers_image). `opened` = a backend
+    accepted the index; `delivers` = it produced a non-black frame within
+    warm_secs. Some indices open but stay black (an absent Continuity Camera, or
+    a cam the OS hasn't granted permission to yet)."""
+    cap = open_capture(index)
+    try:
+        if not cap.isOpened():
+            return False, False
+        return True, _delivers_image(cap, warm_secs)
+    finally:
+        cap.release()
+
+
+def pick_working_camera(preferred: int = 0, max_index: int = 3,
+                        warm_secs: float = 1.2):
+    """Choose a webcam index that actually produces an image, so the app works on
+    a machine we've never seen — a Mac's index 0 is often an absent/black
+    Continuity Camera while the real webcam is 1 or 2, so hard-coding 0 shows a
+    black feed on someone else's laptop. Tries `preferred` first, then 0..max_index-1.
+    Returns the first index that delivers a real frame; if none delivers, the first
+    that at least opened (so the caller's own warm-up/error path still runs); or
+    None if nothing opened at all."""
+    order: list[int] = []
+    for idx in [preferred, *range(max_index)]:
+        if idx not in order:
+            order.append(idx)
+    opened_fallback = None
+    for idx in order:
+        opened, delivers = _probe_camera(idx, warm_secs)
+        if delivers:
+            return idx
+        if opened and opened_fallback is None:
+            opened_fallback = idx
+    return opened_fallback
+
+
 def _is_realtime(source) -> bool:
     """Webcam indices and network streams are realtime; file paths are not."""
     if isinstance(source, int):

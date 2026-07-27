@@ -35,7 +35,7 @@ from pathlib import Path
 import cv2
 
 from .build import build_pipeline
-from .capture import VideoSource
+from .capture import VideoSource, pick_working_camera
 from .config import DeviceConfig
 from .emitter import MetricEmitter, SessionCounters
 from . import viewer
@@ -125,6 +125,12 @@ class _SharedState:
         self.engagement_model_path: str = ""
         self.candidate_model_path: str = ""
         self.retrain: dict = {
+            "running": False, "done": False, "ok": False, "msg": "", "log": "",
+        }
+        # YOLO detector fine-tune job status the browser polls (separate from the
+        # engagement retrain above — this trains the *person detector* on the R
+        # "not a person" rejects and hand-drawn missed people from this session).
+        self.yolo_ft: dict = {
             "running": False, "done": False, "ok": False, "msg": "", "log": "",
         }
 
@@ -365,6 +371,97 @@ def _run_retrain(state: "_SharedState") -> None:
     _set(running=False, done=True, ok=True, msg=msg, log="\n".join(log_parts)[-4000:])
 
 
+def _run_finetune_yolo(state: "_SharedState", epochs: int = 20, imgsz: int = 640) -> None:
+    """Fine-tune the PERSON DETECTOR (YOLO) on this session's detection verdicts.
+
+    Every box the operator judged in review is already saved to the session's
+    `*_detections.csv` (verdict 1 = real person / hand-drawn missed person,
+    verdict 0 = false positive). Here we pair that CSV with the review frames the
+    pipeline kept (they share the same frame index + pixel space), stage them as a
+    prep JSON, then run the two detector CLIs as subprocesses:
+      build_yolo_dataset  -> Ultralytics dataset (rejects become background)
+      finetune_detector   -> best.pt copied to models/yolo_finetuned.pt
+    Runs on a background thread; the browser polls /api/finetune_yolo_status. The
+    live model is NOT swapped — the operator points device.yaml at the new weights
+    and restarts, exactly like the CLI flow."""
+    def _set(**kw):
+        with state.lock:
+            state.yolo_ft.update(kw)
+
+    _set(running=True, done=False, ok=False, msg="Preparing frames…", log="")
+    log_parts: list[str] = []
+
+    with state.lock:
+        frames = list(state.review_frames)
+        w = state.stats.get("frame_w") or (frames[0]["w"] if frames else 0)
+        h = state.stats.get("frame_h") or (frames[0]["h"] if frames else 0)
+        detect_csv = state.detect_csv_path
+        n_det = len(state.detect_rows)
+
+    if not detect_csv or not Path(detect_csv).exists() or n_det == 0:
+        _set(running=False, done=True, ok=False,
+             msg="No detection verdicts yet — in review, press R on a false positive "
+                 "or drag a box over a missed person, then try again.")
+        return
+    if not frames:
+        _set(running=False, done=True, ok=False, msg="No captured frames to train on.")
+        return
+
+    out_dir = Path("data/detector_dataset")
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        prep_json = out_dir / "_live_session.json"
+        prep = {"video": {"width": int(w), "height": int(h)},
+                "frames": [{"i": f["i"], "frame": f["frame"]} for f in frames]}
+        prep_json.write_text(json.dumps(prep), encoding="utf-8")
+    except (OSError, KeyError, TypeError) as e:
+        _set(running=False, done=True, ok=False, msg=f"Could not stage frames: {e}")
+        return
+
+    def _run(step_name: str, cmd: list[str], timeout: int) -> bool:
+        _set(msg=step_name)
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        except (subprocess.SubprocessError, OSError) as e:
+            log_parts.append(f"$ {' '.join(cmd)}\n{e}")
+            _set(running=False, done=True, ok=False,
+                 msg=f"{step_name} failed to start", log="\n".join(log_parts)[-4000:])
+            return False
+        tail = (proc.stdout or "") + (proc.stderr or "")
+        log_parts.append(f"$ {' '.join(cmd)}\n{tail.strip()}")
+        _set(log="\n".join(log_parts)[-4000:])
+        if proc.returncode != 0:
+            _set(running=False, done=True, ok=False,
+                 msg=f"{step_name} failed (exit {proc.returncode})",
+                 log="\n".join(log_parts)[-4000:])
+            return False
+        return True
+
+    py = sys.executable
+    if not _run("Building detector dataset…",
+                [py, "-m", "visionmetrics.training.detector.build_yolo_dataset",
+                 "--pair", str(detect_csv), str(prep_json), "--out", str(out_dir)],
+                timeout=600):
+        return
+    out_weights = "models/yolo_finetuned.pt"
+    if not _run(f"Fine-tuning YOLO ({epochs} epochs — this can take a while)…",
+                [py, "-m", "visionmetrics.training.detector.finetune_detector",
+                 "--data", str(out_dir / "data.yaml"),
+                 "--epochs", str(epochs), "--imgsz", str(imgsz), "--out", out_weights],
+                timeout=5400):
+        return
+    if not Path(out_weights).exists():
+        _set(running=False, done=True, ok=False,
+             msg="Training finished but no weights were written.",
+             log="\n".join(log_parts)[-4000:])
+        return
+    _set(running=False, done=True, ok=True,
+         msg=f"Done — new detector saved to {out_weights}. To use it, set "
+             "models.yolo to that path in your config (demo: configs/demo.yaml) and "
+             "restart the session.",
+         log="\n".join(log_parts)[-4000:])
+
+
 def _draw_boxes(frame, result, store_name: str):
     """Per-person boxes/labels only — no burned-in HUD block, since the
     browser sidebar (not the video) shows the running totals."""
@@ -517,6 +614,16 @@ def _make_handler(state: _SharedState):
                 self.send_header("Cache-Control", "no-store")
                 self.end_headers()
                 self.wfile.write(body)
+            elif self.path == "/api/finetune_yolo_status":
+                with state.lock:
+                    payload = dict(state.yolo_ft)
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
             elif self.path == "/api/training_stats":
                 body = json.dumps(_training_stats()).encode("utf-8")
                 self.send_response(200)
@@ -593,6 +700,8 @@ def _make_handler(state: _SharedState):
                 self._handle_detect_unlabel()
             elif self.path == "/api/retrain":
                 self._handle_retrain()
+            elif self.path == "/api/finetune_yolo":
+                self._handle_finetune_yolo()
             elif self.path == "/api/rescore":
                 self._handle_rescore()
             elif self.path == "/api/promote":
@@ -719,6 +828,30 @@ def _make_handler(state: _SharedState):
                 state.retrain.update(running=True, done=False, ok=False,
                                      msg="Starting…", log="")
             threading.Thread(target=_run_retrain, args=(state,), daemon=True).start()
+            self._reply_json({"ok": True, "started": True})
+
+        def _handle_finetune_yolo(self) -> None:
+            """Kick off (or refuse to double-start) a background YOLO detector
+            fine-tune on this session's detection verdicts. Returns immediately;
+            the browser polls /api/finetune_yolo_status."""
+            payload = self._read_json() or {}
+            try:
+                epochs = max(1, min(200, int(payload.get("epochs") or 20)))
+            except (TypeError, ValueError):
+                epochs = 20
+            try:
+                imgsz = max(320, min(1280, int(payload.get("imgsz") or 640)))
+            except (TypeError, ValueError):
+                imgsz = 640
+            with state.lock:
+                if state.yolo_ft.get("running"):
+                    self._reply_json({"ok": False, "running": True,
+                                      "msg": "A detector fine-tune is already running."})
+                    return
+                state.yolo_ft.update(running=True, done=False, ok=False,
+                                     msg="Starting…", log="")
+            threading.Thread(target=_run_finetune_yolo, args=(state, epochs, imgsz),
+                             daemon=True).start()
             self._reply_json({"ok": True, "started": True})
 
         def _handle_rescore(self) -> None:
@@ -1130,6 +1263,21 @@ def run(config_path: str, *, debug: bool = False, report_path: str | None = None
     config = DeviceConfig.load(config_path)
     if source is not None:
         config.camera.source = int(source) if str(source).isdigit() else source
+    # Make the camera "just work" on a machine we've never seen. When the source
+    # is a webcam index, pick one that actually delivers an image: on a Mac index 0
+    # is often an absent/black Continuity Camera while the real webcam is 1 or 2,
+    # so the hard-coded 0 the double-click launcher passes would show a black feed
+    # on a friend's laptop. File/RTSP sources are left untouched.
+    if isinstance(config.camera.source, int):
+        picked = pick_working_camera(config.camera.source)
+        if picked is None:
+            print("[web] WARNING: no camera produced an image on indices 0-2. Check the "
+                  "camera is connected and that this app has camera permission "
+                  "(macOS: System Settings > Privacy & Security > Camera).")
+        elif picked != config.camera.source:
+            print(f"[web] camera index {config.camera.source} produced no image; "
+                  f"using the working camera at index {picked} instead.")
+            config.camera.source = picked
     print(f"[web] device={config.device.device_id} store='{config.device.store_name}'")
 
     # ---- one HTTP server + one shared state for the whole process ----
@@ -1274,8 +1422,10 @@ DASHBOARD_HTML = """<!DOCTYPE html>
      the column just scrolls. gap replaces the per-panel margin so spacing stays even. */
   #statsCol .panel { margin-bottom:0; }
 
-  #rcanvas { display:block; max-width:100%; max-height:100%; width:auto; height:auto;
-             margin:0 auto; cursor:crosshair; }
+  /* The review photo fills its whole box edge-to-edge (object-fit:cover), matching
+     the live feed. toCanvas() inverts this cover transform so clicks stay aligned. */
+  #rcanvas { display:block; width:100%; height:100%; object-fit:cover;
+             margin:0; cursor:crosshair; }
   #reviewBar { margin-top:10px; flex:none; }
   .revNav { display:flex; align-items:center; gap:12px; margin-bottom:10px; }
   .revNav #rCounter {
@@ -1632,6 +1782,11 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <div class="metric"><div class="v" id="mAuc">—</div><div class="l">ROC AUC</div></div>
           <div class="metric"><div class="v" id="mBrier">—</div><div class="l">Brier</div></div>
         </div>
+        <div class="metric-row">
+          <div class="metric"><div class="v" id="mMcc">—</div><div class="l" title="Matthews correlation: -1 to 1, robust when the classes are imbalanced">MCC</div></div>
+          <div class="metric"><div class="v" id="mBalAcc">—</div><div class="l" title="Average of the looking- and not-looking accuracies — fair when few people look">Balanced acc.</div></div>
+          <div class="metric"><div class="v" id="mBase">—</div><div class="l" title="Share of labelled people who actually looked (the class balance)">Base rate</div></div>
+        </div>
         <div class="anhint" id="anNote" style="margin-top:12px;"></div>
       </div>
     </div>
@@ -1686,6 +1841,33 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <details style="margin-top:12px;">
         <summary style="font-size:11.5px; color:var(--muted); cursor:pointer;">Training log</summary>
         <pre id="retrainLog" style="font-size:10.5px; color:#4a4752; white-space:pre-wrap; max-height:200px; overflow:auto; background:var(--card2); border:1px solid var(--border); border-radius:8px; padding:8px; margin-top:6px;"></pre>
+      </details>
+    </div>
+
+    <div id="yoloBox" style="margin-top:18px; border-top:1px solid var(--border); padding-top:16px;">
+      <h3 style="margin:0 0 6px;">Improve person detection (YOLO)</h3>
+      <div class="anhint" style="margin-bottom:12px;">
+        Different model from the one above. This fine-tunes the <b>person detector</b> on
+        this session's boxes: every <b>R · Not a person</b> becomes background (fewer false
+        positives) and every box you <b>drew over a missed person</b> becomes a new positive —
+        so YOLO learns <i>your</i> camera, lighting and mistakes. Your live detector stays
+        untouched; the new weights are saved to a file you switch on when ready.
+      </div>
+      <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
+        <button id="bYolo" style="width:auto; background:var(--accent); border-color:var(--accent);">Fine-tune YOLO</button>
+        <label style="font-size:12px; color:#4a4752;">epochs
+          <input id="yoloEpochs" type="number" min="1" max="200" value="20"
+                 style="width:64px; margin-left:4px;">
+        </label>
+        <span id="yoloStatus" style="font-size:12px; color:#4a4752;"></span>
+      </div>
+      <div class="anhint" style="margin-top:8px;">
+        Heads-up: training the detector is heavy — it can take several minutes (longer on a
+        laptop CPU). You can keep using the page; the status updates here when it finishes.
+      </div>
+      <details style="margin-top:12px;">
+        <summary style="font-size:11.5px; color:var(--muted); cursor:pointer;">Training log</summary>
+        <pre id="yoloLog" style="font-size:10.5px; color:#4a4752; white-space:pre-wrap; max-height:200px; overflow:auto; background:var(--card2); border:1px solid var(--border); border-radius:8px; padding:8px; margin-top:6px;"></pre>
       </details>
     </div>
   </div>
@@ -1897,20 +2079,30 @@ function drawFrame() {
 
   for (const p of fr.people) {
     const k = pKey(fr, p.id);
-    let color = COL.unset;
-    if (det[k] === "notperson") color = COL.notperson;
-    else if (gaze[k] === "look") color = COL.look;
-    else if (gaze[k] === "away") color = COL.away;
+    // OUTER ring = how the MODEL originally framed this person when it captured
+    // the frame: green if it thought "looking", red if "not looking".
+    const origLook = p.engaged === true ||
+      (typeof p.p_look === "number" && p.p_look >= 0.5);
+    let outer = origLook ? COL.look : COL.away;
+    if (det[k] === "notperson") outer = COL.notperson; // you rejected the box entirely
+    // INNER thick frame = YOUR verdict; white until you label it.
+    let inner = null;
+    if (det[k] === "notperson") inner = COL.notperson;
+    else if (gaze[k] === "look") inner = COL.look;
+    else if (gaze[k] === "away") inner = COL.away;
     const isSel = sel && sel.kind === "person" && sel.id === p.id;
-    drawBox(p.box, color, isSel, boxTag(p, k));
+    drawBox(p.box, outer, inner, isSel, boxTag(p, k));
   }
   for (const m of manualList(fr)) {
     const mk = pKey(fr, m.mid);
-    let color = COL.manual;
-    if (gaze[mk] === "look") color = COL.look;
-    else if (gaze[mk] === "away") color = COL.away;
+    // Boxes YOU added weren't seen by the model, so there is no "original
+    // framing" — the outer ring stays teal (added) and the inner frame follows
+    // your verdict.
+    let inner = null;
+    if (gaze[mk] === "look") inner = COL.look;
+    else if (gaze[mk] === "away") inner = COL.away;
     const isSel = sel && sel.kind === "manual" && sel.mid === m.mid;
-    drawBox(m.box, color, isSel, manualTag(mk));
+    drawBox(m.box, COL.manual, inner, isSel, manualTag(mk), true);  // thin: hand-drawn
   }
   $("rCounter").textContent = `Frame ${fIdx + 1} / ${frames.length}  ·  t=${fr.t}s`;
   $("rNext").textContent = fIdx >= frames.length - 1 ? "Analyze →" : "Next →";
@@ -1929,20 +2121,34 @@ function manualTag(mk) {
   return "added";
 }
 
-function drawBox(box, color, selected, tag) {
+// Two concentric rings tell two different stories:
+//   outerColor — how the MODEL originally framed this person (green/red/orange)
+//   innerColor — YOUR own verdict; null means "not labeled yet" → drawn white
+function drawBox(box, outerColor, innerColor, selected, tag, thin) {
   const [x1, y1, x2, y2] = box;
-  ctx.lineWidth = selected ? 4 : 2.5;
-  ctx.strokeStyle = selected ? "#ffffff" : color;
-  ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+  const w = x2 - x1, h = y2 - y1;
+  // Selection halo — a gold offset ring so the active box stands out without
+  // clashing with the green/red/white rings that carry meaning.
   if (selected) {
-    ctx.lineWidth = 2;
-    ctx.strokeStyle = color;
-    ctx.strokeRect(x1 - 3, y1 - 3, x2 - x1 + 6, y2 - y1 + 6);
+    ctx.lineWidth = thin ? 1.25 : 2;
+    ctx.strokeStyle = "#ffcf3f";
+    ctx.strokeRect(x1 - 3, y1 - 3, w + 6, h + 6);
   }
+  // OUTER ring — the model's original framing. `thin` (boxes YOU drew) uses much
+  // finer lines so a hand-added box reads as lightweight next to the model's own.
+  ctx.lineWidth = thin ? (selected ? 1.25 : 1) : (selected ? 3.5 : 2.5);
+  ctx.strokeStyle = outerColor;
+  ctx.strokeRect(x1, y1, w, h);
+  // INNER frame — your verdict; white until you decide (thin for hand-drawn boxes).
+  const pad = thin ? 2.5 : 4;
+  ctx.lineWidth = thin ? (selected ? 1.5 : 1.25) : (selected ? 4 : 3);
+  ctx.strokeStyle = innerColor || "#ffffff";
+  ctx.strokeRect(x1 + pad, y1 + pad, Math.max(1, w - 2 * pad), Math.max(1, h - 2 * pad));
+  // Label chip uses the outer (model) color so the tag matches the outer ring.
   const label = " " + tag + " ";
   ctx.font = "600 13px -apple-system, Segoe UI, sans-serif";
   const tw = ctx.measureText(label).width;
-  ctx.fillStyle = color;
+  ctx.fillStyle = outerColor;
   ctx.fillRect(x1, Math.max(0, y1 - 20), tw, 18);
   ctx.fillStyle = "#ffffff";
   ctx.textBaseline = "top";
@@ -1977,8 +2183,13 @@ canvas.addEventListener("mouseup", (e) => {
 
 function toCanvas(e) {
   const r = canvas.getBoundingClientRect();
-  return { x: (e.clientX - r.left) * (canvas.width / r.width),
-           y: (e.clientY - r.top) * (canvas.height / r.height) };
+  const cw = canvas.width, ch = canvas.height;
+  // Canvas is shown with object-fit:cover (fills the box, centre-cropped). Invert
+  // that transform so a click maps back to the right pixel in canvas space.
+  const scale = Math.max(r.width / cw, r.height / ch);
+  const offX = (r.width - cw * scale) / 2, offY = (r.height - ch * scale) / 2;
+  return { x: (e.clientX - r.left - offX) / scale,
+           y: (e.clientY - r.top - offY) / scale };
 }
 
 function inBox(x, y, b) { return x >= b[0] && x <= b[2] && y >= b[1] && y <= b[3]; }
@@ -2065,9 +2276,17 @@ function maybeAdvance() {
     return gaze[k] || det[k] === "notperson";
   });
   const manualDone = ml.every((m) => gaze[pKey(fr, m.mid)]);
-  if (peopleDone && manualDone && fIdx < frames.length - 1) {
+  if (peopleDone && manualDone) {
     const from = fIdx;
-    setTimeout(() => { if (fIdx === from) gotoFrame(from + 1); }, 200);
+    if (fIdx < frames.length - 1) {
+      setTimeout(() => { if (fIdx === from) gotoFrame(from + 1); }, 200);
+    } else {
+      // Last frame just got its final verdict: flow straight into the analysis
+      // page instead of stalling on the last image.
+      setTimeout(() => {
+        if (fIdx === from && stopped && $("analysis").style.display === "none") goAnalysis();
+      }, 350);
+    }
   }
 }
 
@@ -2075,7 +2294,18 @@ function markReject() {
   const fr = curFrame();
   if (sel && sel.kind === "manual") { deleteManual(); return; }
   const p = selectedPerson();
-  if (!p) { flash("Click a box first."); return; }
+  if (!p) {
+    // R with nothing to reject: if the model detected no one on this frame (and you
+    // haven't drawn a box), treat R as "nothing here → skip to the next photo", so
+    // empty frames don't stall the flow — no mouse, no Next button needed.
+    if (!fr.people.length && !manualList(fr).length) {
+      flash("Nothing here \u2713 — next photo.");
+      nextFrameOrAnalyze();
+      return;
+    }
+    flash("Click a box first.");
+    return;
+  }
   const k = pKey(fr, p.id);
   det[k] = "notperson"; delete gaze[k];
   saveReject(fr, p);
@@ -2486,6 +2716,17 @@ function renderConfusion() {
   const fmt = (v) => isNaN(v) ? "—" : v.toFixed(2);
   $("mPrec").textContent = fmt(prec); $("mRec").textContent = fmt(rec);
   $("mF1").textContent = fmt(f1); $("mAcc").textContent = fmt(acc);
+  // Extra reads that hold up when the classes are imbalanced (few people look):
+  //  · MCC — a single -1..1 score that only goes high when BOTH classes are right.
+  //  · Balanced accuracy — the mean of the two per-class hit rates.
+  //  · Base rate — what fraction of the labelled people actually looked.
+  const tnr = (tn + fp) ? tn / (tn + fp) : NaN;
+  const balAcc = (isNaN(rec) || isNaN(tnr)) ? NaN : (rec + tnr) / 2;
+  const mccDen = Math.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn));
+  const mcc = mccDen ? (tp * tn - fp * fn) / mccDen : NaN;
+  const base = anPairs.length ? (tp + fn) / anPairs.length : NaN;
+  $("mMcc").textContent = fmt(mcc); $("mBalAcc").textContent = fmt(balAcc);
+  $("mBase").textContent = isNaN(base) ? "—" : Math.round(base * 100) + "%";
 }
 
 function runAnalysis() {
@@ -2623,6 +2864,37 @@ function renderCompare(items, oldS, newS) {
 }
 
 $("bRetrain").onclick = runRetrain;
+
+// ---- fine-tune the YOLO person detector on this session's detection verdicts ----
+let yoloTimer = null;
+async function runYolo() {
+  const epochs = Math.max(1, Math.min(200, parseInt($("yoloEpochs").value, 10) || 20));
+  $("bYolo").disabled = true;
+  $("yoloStatus").textContent = "Starting…";
+  try {
+    const r = await (await fetch("/api/finetune_yolo", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ epochs }),
+    })).json();
+    if (!r.ok) { $("yoloStatus").textContent = r.msg || "Could not start."; $("bYolo").disabled = false; return; }
+  } catch (e) { $("yoloStatus").textContent = "Could not reach the server."; $("bYolo").disabled = false; return; }
+  pollYolo();
+}
+
+function pollYolo() {
+  clearTimeout(yoloTimer);
+  yoloTimer = setTimeout(async () => {
+    let s;
+    try { s = await (await fetch("/api/finetune_yolo_status", { cache: "no-store" })).json(); }
+    catch (e) { $("yoloStatus").textContent = "Lost contact with the trainer."; $("bYolo").disabled = false; return; }
+    $("yoloStatus").textContent = s.msg || "";
+    if (s.log) $("yoloLog").textContent = s.log;
+    if (s.running) { pollYolo(); return; }
+    $("bYolo").disabled = false;
+  }, 1500);
+}
+$("bYolo").onclick = runYolo;
+
 $("bPromote").onclick = async () => {
   $("bPromote").disabled = true;
   try {
