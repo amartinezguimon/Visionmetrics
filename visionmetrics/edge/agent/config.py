@@ -34,7 +34,11 @@ class CameraConfig:
 class VisionConfig:
     face_width_m: float = 0.16
     yolo_conf_min: float = 0.45
-    aspect_ratio_min: float = 0.75
+    # 0.4 (was 0.75): keep boxes up to ~2.5x wider-than-tall. In a crowd you only
+    # see many people head-and-shoulders (box is wide + short, h/w < 0.75), so the
+    # old 0.75 floor discarded real people YOLO had already detected. 0.4 still
+    # rejects genuinely flat non-people (benches, bags, reflections).
+    aspect_ratio_min: float = 0.4
     # Passerby counting (foot traffic): a track counts as a real person once it
     # has PERSISTED for a few frames AND has either moved or shown a face — which
     # rejects flickery false boxes and static furniture (a chair never does both).

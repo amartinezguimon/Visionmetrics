@@ -462,11 +462,59 @@ def _run_finetune_yolo(state: "_SharedState", epochs: int = 20, imgsz: int = 640
          log="\n".join(log_parts)[-4000:])
 
 
-def _draw_boxes(frame, result, store_name: str):
+class BoxSmoother:
+    """Exponential moving average of each track's box, for the DRAWN overlay only.
+
+    YOLO+ByteTrack give a box that jitters a few pixels every frame even when the
+    person is standing still, and in a busy scene boxes visibly twitch and swim.
+    That looks laggy/chaotic to the viewer even when tracking is actually fine.
+    We keep a per-track_id EMA of the four corner coords and draw the smoothed
+    box instead of the raw one: new = a*raw + (1-a)*prev. `alpha` ~0.4 removes
+    the twitch while still following real movement within a couple of frames.
+
+    IMPORTANT: this touches ONLY the pixels we render. Counting, zone tests,
+    engagement, and the clickable overlay data all still use the raw p.bbox, so
+    smoothing can never change a metric — it is purely cosmetic. Cost is a few
+    floats per person, so it stays free on the CPU budget even in a crowd.
+    """
+
+    def __init__(self, alpha: float = 0.4):
+        self.alpha = alpha
+        self._boxes: dict[int, tuple[float, float, float, float]] = {}
+        self._seen: dict[int, int] = {}
+        self._tick = 0
+
+    def smooth(self, track_id: int, bbox) -> tuple[int, int, int, int]:
+        a = self.alpha
+        prev = self._boxes.get(track_id)
+        if prev is None:
+            cur = tuple(float(v) for v in bbox)          # first sighting: adopt as-is
+        else:
+            cur = tuple(a * float(n) + (1 - a) * p for n, p in zip(bbox, prev))
+        self._boxes[track_id] = cur
+        self._seen[track_id] = self._tick
+        return tuple(int(round(v)) for v in cur)
+
+    def end_frame(self) -> None:
+        """Advance time and forget tracks not seen for a while, so the dict can't
+        grow without bound over a long session."""
+        self._tick += 1
+        stale = [tid for tid, t in self._seen.items() if self._tick - t > 30]
+        for tid in stale:
+            self._boxes.pop(tid, None)
+            self._seen.pop(tid, None)
+
+
+def _draw_boxes(frame, result, store_name: str, smoother: "BoxSmoother | None" = None):
     """Per-person boxes/labels only — no burned-in HUD block, since the
-    browser sidebar (not the video) shows the running totals."""
+    browser sidebar (not the video) shows the running totals. When a `smoother`
+    is given, the DRAWN box is its EMA (less twitch in crowds); the label anchor
+    and everything else still key off the smoothed rectangle."""
     for p in result.persons:
-        x1, y1, x2, y2 = p.bbox
+        if smoother is not None:
+            x1, y1, x2, y2 = smoother.smooth(p.track_id, p.bbox)
+        else:
+            x1, y1, x2, y2 = p.bbox
         color = viewer._TIER_COLOR.get(p.tier, (100, 100, 100))
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         label = f"ID:{p.track_id}"
@@ -476,6 +524,8 @@ def _draw_boxes(frame, result, store_name: str):
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
         if p.nose_px is not None:
             cv2.circle(frame, p.nose_px, 4, (0, 255, 0), -1)
+    if smoother is not None:
+        smoother.end_frame()
     return frame
 
 
@@ -1098,6 +1148,8 @@ def _run_one_session(config, state: "_SharedState", *, report_path: str | None,
     # time (not per-frame), so the reviewer scrubs a manageable timeline of the
     # whole scene rather than a flood of per-person crops.
     last_review_t = -1e9
+    # Cosmetic-only EMA so drawn boxes don't twitch/swim in busy scenes.
+    box_smoother = BoxSmoother(alpha=0.4)
     print("[web] running. Click 'Stop session' in the browser (or Ctrl-C here) to end.")
     try:
         while not state.stopping.is_set():
@@ -1174,7 +1226,7 @@ def _run_one_session(config, state: "_SharedState", *, report_path: str | None,
                     if len(state.review_frames) > _REVIEW_QUEUE_CAP:
                         state.review_frames = state.review_frames[-_REVIEW_QUEUE_CAP:]
 
-            annotated = _draw_boxes(frame, result, config.device.store_name)
+            annotated = _draw_boxes(frame, result, config.device.store_name, box_smoother)
             ok_enc, buf = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
             with state.lock:
                 if ok_enc:
