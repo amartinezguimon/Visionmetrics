@@ -106,6 +106,71 @@ def pick_working_camera(preferred: int = 0, max_index: int = 3,
     return opened_indices[0] if opened_indices else None
 
 
+def _mac_camera_names() -> list[str]:
+    """Ordered macOS camera names, where position i corresponds to OpenCV index i.
+
+    macOS enumerates AVFoundation devices in a fixed order that OpenCV mirrors,
+    and `system_profiler` lists them in that SAME order — so the i-th name here
+    is the i-th webcam index. Returns [] if it can't be read (then the caller
+    falls back to index-only heuristics). We can't rely on indices alone because
+    a Continuity Camera (iPhone) grabs index 0 and pushes the built-in FaceTime
+    camera to 1 — the opposite of a plain laptop."""
+    import json
+    import subprocess
+    try:
+        out = subprocess.run(["system_profiler", "-json", "SPCameraDataType"],
+                             capture_output=True, text=True, timeout=10)
+        items = json.loads(out.stdout).get("SPCameraDataType", [])
+        return [str(it.get("_name", "")) for it in items]
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+
+
+def _is_builtin_name(name: str) -> bool:
+    """True for the Mac's OWN built-in webcam (which we must never use)."""
+    return "facetime" in name.lower()
+
+
+def _builtin_camera_indices() -> set[int]:
+    """Camera indices that are the machine's OWN built-in webcam and must never
+    be used for capture. The product only makes sense filming the shop window
+    from an EXTERNAL camera (phone / Camo / USB).
+
+    On macOS we identify the built-in by NAME ("FaceTime"), not by index, because
+    a connected iPhone/Camo takes index 0 and shifts FaceTime to 1. If the names
+    can't be read we conservatively exclude nothing (better to show *a* camera
+    than none). On other platforms we exclude nothing — the store runs off an
+    RTSP/USB source picked explicitly in config."""
+    if sys.platform != "darwin":
+        return set()
+    return {i for i, name in enumerate(_mac_camera_names()) if _is_builtin_name(name)}
+
+
+def pick_external_camera(max_index: int = 6, warm_secs: float = 1.5,
+                         slow_warm_secs: float = 6.0):
+    """Pick a working camera that is NOT the machine's built-in webcam.
+
+    Same two-pass warm-up as `pick_working_camera` (a Continuity Camera / phone
+    can take seconds to wake), but the built-in indices are skipped entirely so
+    we never silently fall back to the laptop's own camera. Returns the external
+    index, or None if no external camera delivers a real image — the caller must
+    then refuse to run rather than use the built-in."""
+    exclude = _builtin_camera_indices()
+    order = [i for i in range(max_index) if i not in exclude]
+
+    opened: list[int] = []
+    for idx in order:
+        opened_ok, delivers = _probe_camera(idx, warm_secs)
+        if delivers:
+            return idx
+        if opened_ok:
+            opened.append(idx)
+    for idx in opened:
+        if _probe_camera(idx, slow_warm_secs)[1]:
+            return idx
+    return None
+
+
 def _is_realtime(source) -> bool:
     """Webcam indices and network streams are realtime; file paths are not."""
     if isinstance(source, int):

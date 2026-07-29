@@ -41,6 +41,26 @@ def test_normalize_requires_feature_columns():
         pass
 
 
+def test_normalize_drops_non_binary_labels():
+    df = pd.DataFrame({
+        "yaw": [0.0, 0.1, 0.2, 0.3, 0.4],
+        "pitch": [0.0, 0.0, 0.0, 0.0, 0.0],
+        "distance": [0.3, 0.3, 0.3, 0.3, 0.3],
+        "label": [1, 0, 2, 0.5, "x"],   # 2, 0.5 and "x" are invalid
+    })
+    out = dataset.normalize(df)
+    assert len(out) == 2                       # only the 1 and 0 survive
+    assert sorted(out["label"].tolist()) == [0, 1]
+    assert out["label"].dtype.kind == "i"      # stays integer
+
+
+def test_normalize_accepts_float_binary_labels():
+    df = _legacy_df()
+    df["label"] = [1.0, 0.0]                    # floats that ARE 0/1
+    out = dataset.normalize(df)
+    assert sorted(out["label"].tolist()) == [0, 1]
+
+
 def test_merge_concatenates(tmp_path):
     a = tmp_path / "a.csv"; b = tmp_path / "b.csv"
     _legacy_df().to_csv(a, index=False)
@@ -48,6 +68,16 @@ def test_merge_concatenates(tmp_path):
     merged = dataset.merge([a, b, tmp_path / "missing.csv"])
     assert len(merged) == 4
     assert list(merged.columns) == dataset.CANONICAL
+
+
+def test_dedupe_drops_exact_duplicates_only():
+    df = dataset.normalize(pd.DataFrame({
+        "yaw": [0.1, 0.1, 0.1], "pitch": [0.0, 0.0, 0.0],
+        "distance": [0.3, 0.3, 0.3], "label": [1, 1, 0],
+    }))
+    out = dataset.dedupe(df)
+    assert len(out) == 2               # the two identical looking rows collapse to 1
+    assert sorted(out["label"].tolist()) == [0, 1]
 
 
 def test_augment_far_scales_distance_only():

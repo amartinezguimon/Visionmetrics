@@ -48,6 +48,11 @@ def main() -> int:
     for p in inputs:
         print(f"  - {p}")
     df = dataset.merge(inputs)
+    before = len(df)
+    df = dataset.dedupe(df)
+    if before != len(df):
+        print(f"Deduped {before - len(df)} exact-duplicate row(s) "
+              f"({before} -> {len(df)}).")
 
     Path(a.output).parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(a.output, index=False)

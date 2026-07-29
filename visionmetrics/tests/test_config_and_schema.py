@@ -8,7 +8,7 @@ def test_empty_config_uses_prototype_defaults():
     cfg = DeviceConfig.from_dict({})
     assert cfg.camera.fov_h_deg == 70.0
     assert cfg.vision.face_width_m == 0.16
-    assert cfg.engagement.count_threshold_s == 2.0
+    assert cfg.engagement.count_threshold_s == 3.0
     assert cfg.uplink.enabled is False
 
 

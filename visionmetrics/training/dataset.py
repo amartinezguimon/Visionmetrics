@@ -52,8 +52,31 @@ def normalize(df: pd.DataFrame) -> pd.DataFrame:
     df.loc[blank, "distance_tier"] = df.loc[blank, "distance"].map(tier_for)
 
     df = df.dropna(subset=_REQUIRED)
-    df["label"] = df["label"].astype(int)
+    # Validate the label is strictly binary. A stray value (a typo, a 2, a 0.5, a
+    # non-numeric cell from a hand-edited CSV) blindly cast with astype(int) would
+    # silently poison BCELoss, so coerce to numeric and DROP anything that isn't
+    # exactly {0, 1} rather than trusting the cast.
+    label_num = pd.to_numeric(df["label"], errors="coerce")
+    valid = label_num.isin([0, 1])
+    dropped = int((~valid).sum())
+    if dropped:
+        bad = sorted(df.loc[~valid, "label"].astype(str).unique())[:5]
+        print(f"[dataset] dropped {dropped} row(s) with a non-binary label "
+              f"(e.g. {bad}); labels must be 0 or 1.")
+    df = df.loc[valid].copy()
+    df["label"] = label_num.loc[valid].astype(int)
     return df[CANONICAL].reset_index(drop=True)
+
+
+def dedupe(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop EXACT duplicate rows (identical features, label AND all metadata).
+
+    Guards against re-ingesting the same data twice — e.g. a session file copied
+    under two names, or the legacy flat CSV overlapping rows already in
+    raw_sessions/. Only byte-identical rows are removed, so two genuinely distinct
+    captures are never merged (they differ in captured_at/session at minimum).
+    """
+    return df.drop_duplicates().reset_index(drop=True)
 
 
 def load_csv(path: str | Path) -> pd.DataFrame:

@@ -22,12 +22,14 @@ import base64
 import csv
 import datetime as dt
 import json
+import os
 import shutil
 import signal
 import subprocess
 import sys
 import threading
 import time
+import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -35,7 +37,7 @@ from pathlib import Path
 import cv2
 
 from .build import build_pipeline
-from .capture import VideoSource, pick_working_camera
+from .capture import VideoSource, pick_external_camera, pick_working_camera
 from .config import DeviceConfig
 from .emitter import MetricEmitter, SessionCounters
 from . import viewer
@@ -162,31 +164,51 @@ class _SharedState:
             })
 
 
+def _atomic_write_csv(path: Path, header: list[str], rows) -> None:
+    """Write a CSV so an interrupted write can never truncate the real file.
+
+    We rewrite the whole session file on every label/undo (see `_save_labels`).
+    Writing in-place with "w" means a crash/power-loss mid-write leaves a
+    half-written file and the WHOLE session's labels are lost. Instead we write a
+    sibling temp file, flush+fsync it, then `os.replace()` — an atomic rename on
+    the same filesystem — so the final path is always either the old complete
+    file or the new complete file, never a torn one.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        with open(tmp, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(header)
+            for row in rows:
+                w.writerow([row.get(c, "") for c in header])
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
 def _save_labels(state: "_SharedState") -> None:
     """Rewrite the live-session CSV from `state.label_rows` (call with the lock
     held). Session row counts are small (one live dashboard, one operator), so
     a full rewrite on every label/undo is simplest and keeps the file always
-    consistent with the in-memory queue — no separate append/undo bookkeeping."""
+    consistent with the in-memory queue — no separate append/undo bookkeeping.
+    The rewrite is atomic (temp file + rename) so a crash can't corrupt it."""
     if state.csv_path is None:
         return
-    state.csv_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(state.csv_path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(SESSION_COLUMNS)
-        for row in state.label_rows.values():
-            w.writerow([row.get(c, "") for c in SESSION_COLUMNS])
+    _atomic_write_csv(state.csv_path, SESSION_COLUMNS, state.label_rows.values())
 
 
 def _save_detections(state: "_SharedState") -> None:
     """Same idea as `_save_labels`, for the detection-verification CSV."""
     if state.detect_csv_path is None:
         return
-    state.detect_csv_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(state.detect_csv_path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(DETECTION_COLUMNS)
-        for row in state.detect_rows.values():
-            w.writerow([row.get(c, "") for c in DETECTION_COLUMNS])
+    _atomic_write_csv(state.detect_csv_path, DETECTION_COLUMNS, state.detect_rows.values())
 
 
 def _append_history(store_name: str, totals: dict, started_at: str,
@@ -535,6 +557,17 @@ KNOWN_COLLECTORS = ["Alvaro", "Hector", "Cristian"]
 _RAW_SESSIONS_DIR = Path("data/raw_sessions")
 
 
+def _valid_collector(payload: dict) -> str | None:
+    """Return the collector name only if it's a real, known collector.
+
+    Attribution is written into EVERY row and cannot be reconstructed after the
+    fact, so we refuse to persist a row with a missing/blank/unknown collector
+    instead of silently stamping it "unknown" (which is what poisoned the older
+    sessions). The browser already forces a choice; this is the backend guard."""
+    name = str(payload.get("collector") or "").strip()
+    return name if name in KNOWN_COLLECTORS else None
+
+
 def _iter_engagement_csvs():
     """Yield every engagement (look/away) session CSV that build_dataset.py would
     feed into a retrain — i.e. the real training data. Skips the parallel
@@ -547,12 +580,45 @@ def _iter_engagement_csvs():
         yield p
 
 
+TIER_ORDER = ["near", "mid", "far", "v-far"]
+
+
+def _tier_key(row: dict) -> str:
+    """Short tier bucket ('near'/'mid'/'far'/'v-far') for one training row.
+
+    Prefers the stored distance_tier column; falls back to recomputing it from
+    the raw distance so legacy rows without the column still get bucketed.
+    """
+    t = (row.get("distance_tier") or "").strip()
+    if not t:
+        try:
+            t = tier_for(float(row.get("distance")))
+        except (TypeError, ValueError):
+            return ""
+    return t.split(" ")[0]
+
+
+def _row_label(row: dict):
+    """Binary ground-truth label (1=looking, 0=not) or None if the cell is junk."""
+    try:
+        v = float(row.get("label"))
+    except (TypeError, ValueError):
+        return None
+    return int(v) if v in (0.0, 1.0) else None
+
+
 def _training_stats() -> dict:
     """Count the training rows that would go into a retrain, grouped by the
     collector name — so the operator can VERIFY exactly what each person has
-    contributed (this is the same data the model trains on)."""
+    contributed (this is the same data the model trains on).
+
+    Also breaks the set down by distance tier x looking/not-looking, so the
+    operator can SEE which conditions are thin and label to fill the gap — the
+    point being that every collected row should actually cover a new case.
+    """
     per: dict[str, int] = {}
     total, files = 0, 0
+    coverage = {t: {"look": 0, "away": 0} for t in TIER_ORDER}
     for p in _iter_engagement_csvs():
         try:
             with open(p, newline="", encoding="utf-8") as f:
@@ -564,10 +630,18 @@ def _training_stats() -> dict:
                     name = (row.get("collector") or "unknown").strip() or "unknown"
                     per[name] = per.get(name, 0) + 1
                     total += 1
+                    tkey = _tier_key(row)
+                    if tkey in coverage:
+                        lbl = _row_label(row)
+                        if lbl == 1:
+                            coverage[tkey]["look"] += 1
+                        elif lbl == 0:
+                            coverage[tkey]["away"] += 1
         except OSError:
             continue
     return {"total": total, "files": files, "per_collector": per,
-            "collectors": KNOWN_COLLECTORS, "columns": SESSION_COLUMNS}
+            "collectors": KNOWN_COLLECTORS, "columns": SESSION_COLUMNS,
+            "coverage": coverage, "tier_order": TIER_ORDER}
 
 
 def _training_csv_bytes() -> bytes:
@@ -786,15 +860,22 @@ def _make_handler(state: _SharedState):
             payload = self._read_json()
             key = str(payload.get("key") or "")
             yaw = payload.get("yaw")
+            collector = _valid_collector(payload)
             if not key or yaw is None:
                 self._reply_json({"ok": False})
+                return
+            if collector is None:
+                self._reply_json({"ok": False, "error": "collector required"})
                 return
             row = {
                 "yaw": yaw, "pitch": payload.get("pitch"), "distance": payload.get("distance"),
                 "label": int(payload.get("label", 0)),
                 "distance_tier": payload.get("tier") or "",
-                "glasses": "unknown", "headwear": "unknown", "subject": "unknown",
-                "collector": payload.get("collector") or "unknown",
+                "glasses": payload.get("glasses") or "unknown",
+                "headwear": payload.get("headwear") or "unknown",
+                "subject": (str(payload.get("subject")).strip() or "unknown")
+                           if payload.get("subject") else "unknown",
+                "collector": collector,
                 "session": state.session_id,
                 "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             }
@@ -828,15 +909,19 @@ def _make_handler(state: _SharedState):
             payload = self._read_json()
             key = str(payload.get("key") or "")
             box = payload.get("box") or [0, 0, 0, 0]
+            collector = _valid_collector(payload)
             if not key:
                 self._reply_json({"ok": False})
+                return
+            if collector is None:
+                self._reply_json({"ok": False, "error": "collector required"})
                 return
             row = {
                 "frame_idx": payload.get("frameIdx"), "track_id": payload.get("id"),
                 "x1": box[0], "y1": box[1], "x2": box[2], "y2": box[3],
                 "conf": payload.get("conf"),
                 "verdict": int(payload.get("verdict", 0)),
-                "collector": payload.get("collector") or "unknown",
+                "collector": collector,
                 "session": state.session_id,
                 "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(),
             }
@@ -1083,8 +1168,11 @@ def _run_one_session(config, state: "_SharedState", *, report_path: str | None,
     # Every look/away label the operator makes in review is persisted live, in
     # the same data/raw_sessions/ folder build_dataset.py scans — no manual
     # "download CSV + move file" step needed after the session.
+    # Timestamp keeps sessions human-sortable; the short random suffix guarantees
+    # two runs started in the SAME second (or a quick restart) never collide and
+    # silently overwrite each other's CSV/images.
     session_stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
-    session_id = f"live_{session_stamp}"
+    session_id = f"live_{session_stamp}_{uuid.uuid4().hex[:6]}"
     state.reset_for_session(
         session_id,
         Path("data/raw_sessions") / f"{session_id}.csv",
@@ -1328,14 +1416,28 @@ def run(config_path: str, *, debug: bool = False, report_path: str | None = None
         review_seconds: float = 10.0,
         max_width: int = 640, loop: bool = False) -> int:
     config = DeviceConfig.load(config_path)
-    if source is not None:
+    # "external" = the product rule: always film from an EXTERNAL camera
+    # (phone / Camo / USB), never the machine's own built-in. We pick a working
+    # external index and REFUSE to run (invalid source -> open() fails) if none
+    # is present, instead of silently using the Mac's FaceTime camera.
+    if str(source).strip().lower() == "external":
+        picked = pick_external_camera()
+        if picked is None:
+            print("[web] ERROR: no encuentro ninguna cámara EXTERNA con imagen.\n"
+                  "      Este producto SIEMPRE filma desde una cámara externa (nunca la del Mac).\n"
+                  "      1) Conecta el móvil / abre Camo y comprueba que VES el vídeo en la app.\n"
+                  "      2) Permiso de cámara: System Settings > Privacy & Security > Camera →\n"
+                  "         activa Terminal, cierra y reabre esta ventana.")
+            config.camera.source = -1  # will fail to open -> clean exit, no built-in fallback
+        else:
+            print(f"[web] cámara externa seleccionada: índice {picked}")
+            config.camera.source = picked
+    elif source is not None:
         config.camera.source = int(source) if str(source).isdigit() else source
-    # Make the camera "just work" on a machine we've never seen. When the source
-    # is a webcam index, pick one that actually delivers an image: on a Mac index 0
-    # is often an absent/black Continuity Camera while the real webcam is 1 or 2,
-    # so the hard-coded 0 the double-click launcher passes would show a black feed
-    # on a friend's laptop. File/RTSP sources are left untouched.
-    if isinstance(config.camera.source, int):
+    # Explicit webcam index (or the config default): pick one that actually
+    # delivers an image. File/RTSP sources are left untouched.
+    if isinstance(config.camera.source, int) and config.camera.source >= 0 \
+            and str(source).strip().lower() != "external":
         picked = pick_working_camera(config.camera.source)
         if picked is None:
             print("[web] AVISO: ninguna cámara entregó imagen en los índices 0-2.\n"
@@ -1481,6 +1583,36 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     color:#fff; display:flex; align-items:center; justify-content:center;
     font-size:12px; font-weight:700; letter-spacing:0.3px;
   }
+  /* Top navigation: switch between the Operación tool and the client-preview dashboard. */
+  #topnav { display:flex; gap:3px; flex:none; background:var(--card); border:1px solid var(--border);
+            border-radius:999px; padding:4px; box-shadow:0 1px 4px rgba(0,0,0,0.03); }
+  .navitem { padding:7px 16px; border-radius:999px; font-size:12.5px; font-weight:600;
+             color:#6c6975; cursor:pointer; transition:background .15s ease, color .15s ease; }
+  .navitem.active { background:var(--purple-deep); color:#fff; }
+
+  /* ── Client-preview dashboard (how the shop would see its own numbers) ── */
+  #clientPreview { padding:12px 32px 28px; overflow-y:auto; }
+  .cp-welcome { font-size:20px; font-weight:600; color:var(--ink); margin-bottom:4px; }
+  .cp-sub { font-size:12px; color:var(--muted); margin-bottom:16px; }
+  .cp-kpis { display:flex; gap:14px; flex-wrap:wrap; margin-bottom:14px; }
+  .cp-kpi { flex:1; min-width:150px; background:var(--card); border:1px solid var(--border);
+            border-radius:16px; padding:18px 20px; }
+  .cp-kpi .k-l { font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.07em;
+                 color:var(--slate,#5e6e83); margin-bottom:6px; }
+  .cp-kpi .k-v { font-size:38px; font-weight:800; letter-spacing:-2px; line-height:1; color:var(--ink); }
+  .cp-kpi .k-v.accent { color:var(--accent); }
+  .cp-kpi .k-s { font-size:10.5px; color:var(--muted); margin-top:5px; }
+  .cp-grid { display:grid; grid-template-columns:2fr 1fr; gap:14px; }
+  @media (max-width:900px){ .cp-grid { grid-template-columns:1fr; } }
+  .cp-card { background:var(--card); border:1px solid var(--border); border-radius:16px; padding:20px; }
+  .cp-card h4 { margin:0 0 2px; font-size:16px; font-weight:700; color:var(--ink); }
+  .cp-card .c-l { font-size:10px; font-weight:600; text-transform:uppercase; letter-spacing:.07em; color:var(--muted); }
+  .cp-range { display:flex; gap:3px; background:var(--card); border:1px solid var(--border);
+              border-radius:999px; padding:3px; }
+  .cp-range .r { padding:6px 12px; border-radius:999px; font-size:11.5px; font-weight:600;
+                 color:#6c6975; cursor:pointer; }
+  .cp-range .r.active { background:var(--purple-deep); color:#fff; }
+  .cp-plot { width:100%; height:auto; display:block; }
 
   #layout { display:flex; gap:20px; padding:12px 32px 20px; align-items:stretch; min-height:0; overflow:hidden; }
   #videoCol { flex:4; min-width:460px; display:flex; flex-direction:column; min-height:0; }
@@ -1694,6 +1826,28 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   .cmp .delta { font-size:11px; font-weight:700; }
   .cmp .up { color:var(--look); }
   .cmp .down { color:var(--away); }
+  .thchip { background:var(--card2); border:1px solid var(--border); border-radius:999px;
+            padding:4px 12px; font-size:12px; font-weight:700; color:var(--accent); cursor:pointer;
+            font-variant-numeric:tabular-nums; transition:background .15s ease, border-color .15s ease; width:auto; }
+  .thchip:hover { background:#f0ebff; border-color:var(--accent); }
+  .tier { width:100%; border-collapse:collapse; font-size:12px; }
+  .tier th, .tier td { padding:6px 8px; text-align:right; border-bottom:1px solid var(--border); white-space:nowrap; }
+  .tier th:first-child, .tier td:first-child { text-align:left; color:var(--muted); font-weight:600; }
+  .tier th { font-size:10.5px; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; }
+  .tier td { font-variant-numeric:tabular-nums; color:#4a4752; }
+  .tier tbody tr:hover { background:var(--card2); }
+  .tier .lo { color:var(--away); font-weight:700; }
+  .tier .hi { color:var(--look); font-weight:700; }
+  .cov { width:100%; border-collapse:collapse; font-size:12.5px; }
+  .cov th, .cov td { padding:8px 10px; text-align:right; border-bottom:1px solid var(--border); white-space:nowrap; }
+  .cov th:first-child, .cov td:first-child { text-align:left; color:var(--muted); font-weight:600; }
+  .cov th { font-size:10.5px; color:var(--muted); text-transform:uppercase; letter-spacing:0.5px; }
+  .cov td { font-variant-numeric:tabular-nums; color:#4a4752; }
+  .cov td.cell { border-radius:6px; font-weight:700; }
+  .cov td.ok { background:rgba(63,174,116,.14); color:#2e7d55; }
+  .cov td.warn { background:rgba(239,143,60,.16); color:#b96712; }
+  .cov td.bad { background:rgba(225,90,77,.15); color:var(--away); }
+  .cov tfoot td { border-top:2px solid var(--border); border-bottom:none; font-weight:700; color:var(--ink); }
   /* history / trends mini-list */
   #trendList .trow { display:flex; justify-content:space-between; gap:8px; padding:5px 0;
                      border-bottom:1px solid var(--border); }
@@ -1705,10 +1859,14 @@ DASHBOARD_HTML = """<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <div id="logo"><span class="dot"></span>VisionMetrics</div>
+  <div id="logo" title="Volver a la pantalla principal" onclick="goHome()"><span class="dot"></span>VisionMetrics</div>
   <div class="head-text">
     <h1 id="store">—</h1>
   </div>
+  <nav id="topnav">
+    <div class="navitem active" id="navOps" onclick="exitClient()">Operación</div>
+    <div class="navitem" id="navClient" onclick="showClient()">Vista cliente</div>
+  </nav>
   <div id="recBadge"><span class="dot"></span>REC</div>
   <div class="live"><span class="dot"></span>En directo</div>
   <div class="avatar">VM</div>
@@ -1720,6 +1878,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <p class="startSub">The live camera fills the screen. When you stop, you'll review the captured frames and check the model.</p>
     <label for="startCollector">Who is labelling? (collector)</label>
     <select id="startCollector">
+      <option value="" disabled selected hidden>— elige quién etiqueta —</option>
       <option value="Alvaro">Alvaro</option>
       <option value="Hector">Hector</option>
       <option value="Cristian">Cristian</option>
@@ -1752,13 +1911,33 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="rbtnrow">
         <button class="rbtn look" id="rLook">L · Looking</button>
         <button class="rbtn away" id="rAway">A · Not looking</button>
-        <button class="rbtn reject" id="rReject">R · Not a person</button>
-        <button class="rbtn" id="rDelete">Delete box</button>
+      </div>
+      <div class="rmeta" style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:8px; font-size:12px;">
+        <label style="display:flex; gap:4px; align-items:center;">Gafas <span class="kbd">7</span>
+          <select id="mGlasses">
+            <option value="unknown">?</option>
+            <option value="no">no</option>
+            <option value="yes">sí</option>
+          </select>
+        </label>
+        <label style="display:flex; gap:4px; align-items:center;">Gorra <span class="kbd">8</span>
+          <select id="mHeadwear">
+            <option value="unknown">?</option>
+            <option value="none">nada</option>
+            <option value="cap">gorra</option>
+            <option value="hat">sombrero</option>
+            <option value="hood">capucha</option>
+          </select>
+        </label>
+        <label style="display:flex; gap:4px; align-items:center;">Sujeto
+          <input id="mSubject" type="text" placeholder="unknown" style="width:110px;">
+        </label>
       </div>
       <div class="rhint">
-        Just tap the keys — the next box is highlighted for you. Drag on empty space to add a missed person.<br>
+        Just tap the keys — the next box is highlighted for you.<br>
         <span class="kbd">L</span> looking &nbsp; <span class="kbd">A</span> not looking &nbsp;
-        <span class="kbd">R</span> not a person &nbsp; <span class="kbd">←</span>/<span class="kbd">→</span> frames
+        <span class="kbd">7</span> gafas &nbsp; <span class="kbd">8</span> gorra &nbsp;
+        <span class="kbd">←</span>/<span class="kbd">→</span> frames
       </div>
       <div id="reviewStatus" style="font-size:11.5px;color:#4a4752;margin-top:8px;"></div>
     </div>
@@ -1773,7 +1952,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="panel">
       <h3>Session totals</h3>
       <div class="stat"><span class="label">Passersby</span><span class="value" id="passersby">0</span></div>
-      <div class="stat"><span class="label">Looked (engaged)</span><span class="value look" id="engaged">0</span></div>
+      <div class="stat"><span class="label">Looked ≥3s (engaged)</span><span class="value look" id="engaged">0</span></div>
       <div class="stat"><span class="label">Engagement rate</span><span class="value look" id="rate">0%</span></div>
       <div class="stat"><span class="label">Total attention</span><span class="value" id="attention">0s</span></div>
     </div>
@@ -1804,10 +1983,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div class="stat"><span class="label">Frames</span><span class="value" id="rFrames">0</span></div>
       <div class="stat"><span class="label">Looking</span><span class="value look" id="rLookN">0</span></div>
       <div class="stat"><span class="label">Not looking</span><span class="value" id="rAwayN">0</span></div>
-      <div class="stat"><span class="label">Rejected boxes</span><span class="value" id="rRejN">0</span></div>
-      <div class="stat"><span class="label">Added (missed)</span><span class="value accent" id="rAddN">0</span></div>
       <button class="rbtn" id="rExportEng" style="margin-top:12px;">Engagement CSV</button>
-      <button class="rbtn" id="rExportDet" style="margin-top:8px;">Detection CSV</button>
       <button id="bAnalyze" style="margin-top:12px;">Analyze model</button>
       <button id="rFinish" style="margin-top:8px;">Finish</button>
       <div id="reviewSaveStatus" style="font-size:11px;color:var(--muted);margin-top:8px;"></div>
@@ -1856,7 +2032,29 @@ DASHBOARD_HTML = """<!DOCTYPE html>
           <div class="metric"><div class="v" id="mBalAcc">—</div><div class="l" title="Average of the looking- and not-looking accuracies — fair when few people look">Balanced acc.</div></div>
           <div class="metric"><div class="v" id="mBase">—</div><div class="l" title="Share of labelled people who actually looked (the class balance)">Base rate</div></div>
         </div>
+        <div class="metric-row">
+          <div class="metric"><div class="v" id="mSpec">—</div><div class="l" title="True-negative rate: share of not-looking people correctly rejected">Specificity</div></div>
+          <div class="metric"><div class="v" id="mLogloss">—</div><div class="l" title="Binary cross-entropy: punishes confident wrong probabilities much harder than Brier. Lower is better">Log loss</div></div>
+          <div class="metric"><div class="v" id="mEce">—</div><div class="l" title="Expected calibration error: gap between the model's stated confidence and the real look-rate. Lower is better">ECE</div></div>
+        </div>
+        <div style="margin-top:10px; font-size:12px; color:#4a4752; display:flex; gap:8px; align-items:center; flex-wrap:wrap;">
+          <span>Suggested threshold →</span>
+          <button class="thchip" id="chipYouden" title="Maximises TPR−FPR (balanced-cost optimum). Click to set the slider here.">Youden-J —</button>
+          <button class="thchip" id="chipF1" title="Maximises F1 (precision/recall balance). Click to set the slider here.">F1-max —</button>
+        </div>
         <div class="anhint" id="anNote" style="margin-top:12px;"></div>
+      </div>
+    </div>
+
+    <div class="an-grid" style="margin-top:14px;">
+      <div class="an-col">
+        <canvas id="calCanvas" class="an-plot" width="360" height="360"></canvas>
+        <div class="an-cap" id="calCap">Reliability — predicted confidence vs actual look-rate</div>
+      </div>
+      <div class="an-col">
+        <div class="an-cap" style="text-align:left; margin:0 0 6px;">Accuracy by distance tier <span style="color:var(--muted);">(at the current threshold)</span></div>
+        <div id="tierTable"></div>
+        <div id="tierEmpty" class="anhint" style="margin-top:8px;">Label people at different distances to see where the model holds up (and where far, small faces break it).</div>
       </div>
     </div>
 
@@ -1913,32 +2111,6 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       </details>
     </div>
 
-    <div id="yoloBox" style="margin-top:18px; border-top:1px solid var(--border); padding-top:16px;">
-      <h3 style="margin:0 0 6px;">Improve person detection (YOLO)</h3>
-      <div class="anhint" style="margin-bottom:12px;">
-        Different model from the one above. This fine-tunes the <b>person detector</b> on
-        this session's boxes: every <b>R · Not a person</b> becomes background (fewer false
-        positives) and every box you <b>drew over a missed person</b> becomes a new positive —
-        so YOLO learns <i>your</i> camera, lighting and mistakes. Your live detector stays
-        untouched; the new weights are saved to a file you switch on when ready.
-      </div>
-      <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center;">
-        <button id="bYolo" style="width:auto; background:var(--accent); border-color:var(--accent);">Fine-tune YOLO</button>
-        <label style="font-size:12px; color:#4a4752;">epochs
-          <input id="yoloEpochs" type="number" min="1" max="200" value="20"
-                 style="width:64px; margin-left:4px;">
-        </label>
-        <span id="yoloStatus" style="font-size:12px; color:#4a4752;"></span>
-      </div>
-      <div class="anhint" style="margin-top:8px;">
-        Heads-up: training the detector is heavy — it can take several minutes (longer on a
-        laptop CPU). You can keep using the page; the status updates here when it finishes.
-      </div>
-      <details style="margin-top:12px;">
-        <summary style="font-size:11.5px; color:var(--muted); cursor:pointer;">Training log</summary>
-        <pre id="yoloLog" style="font-size:10.5px; color:#4a4752; white-space:pre-wrap; max-height:200px; overflow:auto; background:var(--card2); border:1px solid var(--border); border-radius:8px; padding:8px; margin-top:6px;"></pre>
-      </details>
-    </div>
   </div>
 
   <div class="panel" id="trainDataPanel">
@@ -1947,13 +2119,7 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <a id="btnTrainCsv" class="rbtn" href="/api/training_csv" download
          style="width:auto; text-decoration:none; text-align:center; line-height:1.2;">⬇ Download training CSV</a>
     </div>
-    <div class="anhint" style="margin:8px 0 12px;">
-      Every row you label is appended to <code>data/raw_sessions/*.csv</code>. That folder is
-      <b>exactly</b> what <code>build_dataset.py</code> reads to retrain the engagement model —
-      nothing else. The download above is those files merged into one CSV so you can verify it
-      yourself. The bar chart counts how many labelled rows each of us has contributed.
-    </div>
-    <div id="trainSummary" style="font-size:13px; color:#4a4752; margin-bottom:10px;"></div>
+    <div id="trainSummary" style="font-size:13px; color:#4a4752; margin:8px 0 10px;"></div>
     <div class="an-grid">
       <div class="an-col">
         <canvas id="trainBarCanvas" class="an-plot"></canvas>
@@ -1963,6 +2129,15 @@ DASHBOARD_HTML = """<!DOCTYPE html>
         <div id="trainTable"></div>
         <div id="trainEmpty" class="anhint" style="margin-top:8px;">No training rows yet — label a session and they show up here.</div>
       </div>
+    </div>
+    <div id="coverageBox" style="margin-top:18px; border-top:1px solid var(--border); padding-top:14px;">
+      <h3 style="margin:0 0 4px; font-size:14px; text-transform:none; letter-spacing:0;">Coverage — does this data actually cover every case?</h3>
+      <div class="anhint" style="margin:0 0 12px;">
+        Every row only earns its keep if it teaches the model something new. This breaks the training set down by
+        <b>distance</b> × <b>looking / not looking</b>. Thin or one-sided cells (red) are where the model will guess —
+        label people there next. Aim for a healthy count of BOTH looking and not-looking at every distance.
+      </div>
+      <div id="coverageTable"></div>
     </div>
   </div>
 
@@ -1975,6 +2150,49 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     </div>
     <div id="trendList" style="font-size:11.5px; color:#4a4752;"></div>
     <div id="trendEmpty" style="font-size:11.5px; color:var(--muted);">No sessions recorded yet.</div>
+  </div>
+</div>
+
+<!-- ═══════ CLIENT PREVIEW (optional tab) ═══════ -->
+<!-- A small, read-only dashboard that mimics what the SHOP OWNER would see, built
+     from the same durable session history the tool already records. It never shows
+     video or model internals — only the aggregate numbers a client cares about. -->
+<div id="clientPreview" style="display:none;">
+  <div class="cp-welcome">Vista cliente — <span id="cpStore" style="color:var(--muted);">tu comercio</span></div>
+  <div class="cp-sub">Así vería el comercio sus propios datos. Vista previa a partir del historial de sesiones (sin vídeo).</div>
+
+  <div style="display:flex; justify-content:flex-end; margin-bottom:12px;">
+    <div class="cp-range" id="cpRange">
+      <div class="r active" data-days="7"  onclick="setClientRange(7, this)">7 días</div>
+      <div class="r" data-days="30" onclick="setClientRange(30, this)">30 días</div>
+      <div class="r" data-days="0"  onclick="setClientRange(0, this)">Todo</div>
+    </div>
+  </div>
+
+  <div class="cp-kpis">
+    <div class="cp-kpi"><div class="k-l">Personas que pasaron</div><div class="k-v" id="cpPax">0</div><div class="k-s" id="cpDays">—</div></div>
+    <div class="cp-kpi"><div class="k-l">Tasa de atención</div><div class="k-v accent" id="cpRate">0%</div><div class="k-s">miraron ≥3s / pasaron</div></div>
+    <div class="cp-kpi"><div class="k-l">Miraron ≥3s</div><div class="k-v" id="cpEng">0</div><div class="k-s">personas interesadas</div></div>
+    <div class="cp-kpi"><div class="k-l">Atención total</div><div class="k-v" id="cpAtt">0m</div><div class="k-s" id="cpSess">—</div></div>
+  </div>
+
+  <div class="cp-grid">
+    <div class="cp-card">
+      <div style="display:flex; align-items:flex-start; justify-content:space-between; margin-bottom:14px;">
+        <div><div class="c-l">Actividad por día</div><h4>Personas que pasaron y miraron</h4></div>
+        <div style="display:flex; gap:16px; align-items:center;">
+          <span style="font-size:12px; color:var(--muted);"><span style="display:inline-block;width:10px;height:10px;border-radius:3px;background:#d8d3c8;"></span> Pasaron</span>
+          <span style="font-size:12px; color:var(--muted);"><span style="display:inline-block;width:10px;height:10px;border-radius:3px;background:var(--accent);"></span> Miraron ≥3s</span>
+        </div>
+      </div>
+      <canvas id="cpBars" class="cp-plot"></canvas>
+    </div>
+    <div class="cp-card">
+      <div class="c-l" style="margin-bottom:2px;">Tendencia</div>
+      <h4 style="margin-bottom:12px;">Tasa de atención por día</h4>
+      <canvas id="cpRateLine" class="cp-plot"></canvas>
+      <div id="cpEmpty" style="font-size:12px; color:var(--muted); margin-top:12px;">Aún no hay sesiones registradas.</div>
+    </div>
   </div>
 </div>
 
@@ -2056,7 +2274,12 @@ async function poll() {
 async function startSession() {
   const secs = Math.max(1, Math.min(120, parseInt($("startSeconds").value, 10) || 10));
   const name = ($("startCollector").value || "").trim();
-  if (name) $("collector").value = name;   // carry the name into the review labeler
+  if (!name) {   // attribution is baked into every row and can't be reconstructed later
+    $("startStatus").textContent = "Elige quién etiqueta antes de empezar.";
+    $("startCollector").focus();
+    return;
+  }
+  $("collector").value = name;   // carry the name into the review labeler
   $("btnStart").disabled = true;
   $("startStatus").textContent = "Starting the camera…";
   try { await fetch("/api/start", { method: "POST", body: JSON.stringify({ review_seconds: secs }) }); }
@@ -2224,30 +2447,10 @@ function drawBox(box, outerColor, innerColor, selected, tag, thin) {
   ctx.fillText(label, x1, Math.max(1, y1 - 19));
 }
 
-// ---- pointer: click to select a box, drag on empty space to add a person ----
-let dragStart = null;
-canvas.addEventListener("mousedown", (e) => { dragStart = toCanvas(e); });
-canvas.addEventListener("mousemove", (e) => {
-  if (!dragStart) return;
-  const p = toCanvas(e);
-  if (Math.hypot(p.x - dragStart.x, p.y - dragStart.y) < 5) return;
-  drawFrame();
-  ctx.setLineDash([6, 4]); ctx.lineWidth = 2; ctx.strokeStyle = COL.manual;
-  ctx.strokeRect(dragStart.x, dragStart.y, p.x - dragStart.x, p.y - dragStart.y);
-  ctx.setLineDash([]);
-});
+// ---- pointer: click a detected box to select the person you want to label ----
 canvas.addEventListener("mouseup", (e) => {
-  if (!dragStart) return;
   const p = toCanvas(e);
-  const moved = Math.hypot(p.x - dragStart.x, p.y - dragStart.y);
-  if (moved >= 8) {
-    const box = [Math.round(Math.min(dragStart.x, p.x)), Math.round(Math.min(dragStart.y, p.y)),
-                 Math.round(Math.max(dragStart.x, p.x)), Math.round(Math.max(dragStart.y, p.y))];
-    addManual(box);
-  } else {
-    selectAt(p.x, p.y);
-  }
-  dragStart = null;
+  selectAt(p.x, p.y);
 });
 
 function toCanvas(e) {
@@ -2329,7 +2532,7 @@ function markGaze(label) {
     afterLabel();
     return;
   }
-  flash("Nothing selected — press L / A / R once a box is highlighted.");
+  flash("Nothing selected — click a box, then press L / A.");
 }
 
 // Once every detected box in this frame has a verdict (looking / not-looking /
@@ -2420,16 +2623,20 @@ async function post(url, body) {
   } catch (e) { return { ok: false }; }
 }
 
-// Looking/Not-looking → engagement row (if pose known) + detection true positive.
+// Looking/Not-looking → engagement row. The only model we train is "is this
+// person looking or not", so a box with no head pose has nothing to contribute.
 async function saveGaze(fr, p, label) {
   const key = pKey(fr, p.id);
-  const collector = $("collector").value || "unknown";
+  const collector = $("collector").value;
+  if (!collector) { flash("Elige quién etiqueta (collector) antes de guardar."); return; }
+  if (p.yaw == null) { flash("Sin pose de cabeza — no sirve para mirando/no. Saltando."); updateSummary(); return; }
   const crop = cropB64(fr, p.box);
-  post("/api/detect_label", { key, frameIdx: fr.i, id: p.id, box: p.box, conf: p.conf, verdict: 1, collector, crop });
-  if (p.yaw == null) { flash("Saved (no head pose — detection only, not engagement)."); updateSummary(); return; }
+  const glasses = ($("mGlasses") && $("mGlasses").value) || "unknown";
+  const headwear = ($("mHeadwear") && $("mHeadwear").value) || "unknown";
+  const subject = ($("mSubject") && $("mSubject").value.trim()) || "unknown";
   const d = await post("/api/label", {
     key, yaw: p.yaw, pitch: p.pitch, distance: p.distance, label: label === "look" ? 1 : 0,
-    tier: p.tier || tierFor(p.distance), collector, crop,
+    tier: p.tier || tierFor(p.distance), collector, glasses, headwear, subject, crop,
   });
   if (d && d.ok) flash(`Saved → ${d.path}`);
   updateSummary();
@@ -2438,7 +2645,7 @@ async function saveGaze(fr, p, label) {
 // Not-a-person → detection false positive; drop any engagement row.
 async function saveReject(fr, p) {
   const key = pKey(fr, p.id);
-  const collector = $("collector").value || "unknown";
+  const collector = $("collector").value;
   post("/api/unlabel", { key });
   const d = await post("/api/detect_label", {
     key, frameIdx: fr.i, id: p.id, box: p.box, conf: p.conf, verdict: 0, collector, crop: cropB64(fr, p.box),
@@ -2450,7 +2657,7 @@ async function saveReject(fr, p) {
 // Drawn missed person → detection true positive under a negative track id.
 async function saveManual(fr, mid, box) {
   const key = pKey(fr, mid);
-  const collector = $("collector").value || "unknown";
+  const collector = $("collector").value;
   const d = await post("/api/detect_label", {
     key, frameIdx: fr.i, id: mid, box, conf: null, verdict: 1, collector, crop: cropB64(fr, box),
   });
@@ -2463,7 +2670,7 @@ function unsaveManual(fr, mid) { post("/api/detect_unlabel", { key: pKey(fr, mid
 // so there's no engagement row — we keep it as a confirmed detection (verdict 1)
 // and record the verdict locally so it colours + counts in the summary.
 async function saveManualGaze(fr, m, label) {
-  const collector = $("collector").value || "unknown";
+  const collector = $("collector").value;
   await post("/api/detect_label", {
     key: pKey(fr, m.mid), frameIdx: fr.i, id: m.mid, box: m.box,
     conf: null, verdict: 1, collector, crop: cropB64(fr, m.box),
@@ -2477,17 +2684,13 @@ async function saveManualGaze(fr, m, label) {
 function flash(msg) { $("reviewSaveStatus").textContent = msg; }
 
 function updateSummary() {
-  let look = 0, away = 0, rej = 0;
+  let look = 0, away = 0;
   for (const k in gaze) { if (gaze[k] === "look") look++; else if (gaze[k] === "away") away++; }
-  for (const k in det) { if (det[k] === "notperson") rej++; }
-  let added = 0; for (const i in manual) added += manual[i].length;
   $("rFrames").textContent = frames.length;
   $("rLookN").textContent = look;
   $("rAwayN").textContent = away;
-  $("rRejN").textContent = rej;
-  $("rAddN").textContent = added;
   $("reviewStatus").textContent = frames.length
-    ? `Frame ${fIdx + 1} of ${frames.length}. Tap L / A / R — next box auto-selected. Drag empty space to add a missed person.`
+    ? `Frame ${fIdx + 1} of ${frames.length}. Tap L / A — next box auto-selected.`
     : "";
 }
 
@@ -2495,10 +2698,15 @@ function updateSummary() {
 // The four phases (start -> live -> label -> analysis) each own the whole
 // viewport. start -> live happens in startSession(); live -> label in
 // enterReview(); label -> analysis when the reviewer finishes the last frame.
+let lastOpsScreen = "start";   // remembered so the client tab can return here
 function showScreen(name) {
   const onStart = name === "start";
   const onAnalysis = name === "analysis";
   const onLayout = !onStart && !onAnalysis;
+  lastOpsScreen = name;
+  // Leaving the client tab is implicit whenever we switch operational screens.
+  if (cpOpen) { cpOpen = false; $("clientPreview").style.display = "none";
+    $("navClient").classList.remove("active"); $("navOps").classList.add("active"); }
   $("startScreen").style.display = onStart ? "flex" : "none";
   $("layout").style.display = onLayout ? "flex" : "none";
   $("analysis").style.display = onAnalysis ? "block" : "none";
@@ -2517,8 +2725,6 @@ $("rPrev").onclick = () => gotoFrame(fIdx - 1);
 $("rNext").onclick = () => nextFrameOrAnalyze();
 $("rLook").onclick = () => markGaze("look");
 $("rAway").onclick = () => markGaze("away");
-$("rReject").onclick = () => markReject();
-$("rDelete").onclick = () => deleteManual();
 
 window.addEventListener("keydown", (e) => {
   if (!stopped) return;
@@ -2526,19 +2732,148 @@ window.addEventListener("keydown", (e) => {
   const k = e.key.toLowerCase();
   if (k === "l") markGaze("look");
   else if (k === "a") markGaze("away");
-  else if (k === "r") markReject();
+  else if (k === "7") cycleMeta("mGlasses", "Gafas");
+  else if (k === "8") cycleMeta("mHeadwear", "Gorra");
   else if (e.key === "ArrowRight") nextFrameOrAnalyze();
   else if (e.key === "ArrowLeft") gotoFrame(fIdx - 1);
-  else if (e.key === "Backspace" || e.key === "Delete") { deleteManual(); e.preventDefault(); }
 });
-window.addEventListener("resize", () => { if (stopped) drawFrame(); redrawAnalysisCharts(); });
+
+// Confirm optional metadata with a single keypress instead of the dropdowns:
+// 7 cycles the glasses value, 8 cycles the headwear value. The <select> stays as
+// the visible state — we just advance it and flash the new value.
+function cycleMeta(id, name) {
+  const el = $(id);
+  if (!el) return;
+  el.selectedIndex = (el.selectedIndex + 1) % el.options.length;
+  flash(`${name}: ${el.options[el.selectedIndex].text}`);
+}
+window.addEventListener("resize", () => {
+  if (stopped) drawFrame();
+  redrawAnalysisCharts();
+  if (cpOpen) { redrawChart($("cpBars")); redrawChart($("cpRateLine")); }
+});
+
+// ================= CLIENT PREVIEW (optional dashboard tab) =================
+// A read-only mock of what the shop owner would see, built from the same durable
+// session history (/api/history) the tool already records — aggregated per day.
+// It deliberately shows only client-facing numbers: footfall, attention rate and
+// attention time. No video, no model internals.
+let cpOpen = false;
+let clientDays = 7;   // range filter: 7 / 30 / 0 (all)
+
+function showClient() {
+  cpOpen = true;
+  $("navClient").classList.add("active");
+  $("navOps").classList.remove("active");
+  $("startScreen").style.display = "none";
+  $("layout").style.display = "none";
+  $("analysis").style.display = "none";
+  $("clientPreview").style.display = "block";
+  loadClient();
+}
+function exitClient() {
+  if (!cpOpen) { $("navOps").classList.add("active"); $("navClient").classList.remove("active"); return; }
+  cpOpen = false;
+  $("clientPreview").style.display = "none";
+  $("navClient").classList.remove("active");
+  $("navOps").classList.add("active");
+  showScreen(lastOpsScreen);
+}
+function setClientRange(days, el) {
+  clientDays = days;
+  [...document.querySelectorAll("#cpRange .r")].forEach((r) => r.classList.remove("active"));
+  if (el) el.classList.add("active");
+  loadClient();
+}
+
+async function loadClient() {
+  $("cpStore").textContent = $("store").textContent && $("store").textContent !== "—"
+    ? $("store").textContent : "tu comercio";
+  let data;
+  try { data = await (await fetch("/api/history", { cache: "no-store" })).json(); }
+  catch (e) { data = { sessions: [] }; }
+  // Aggregate every finished session into its calendar day.
+  const byDay = {};
+  for (const s of (data.sessions || [])) {
+    const d = s.date || (s.ended_at || "").slice(0, 10);
+    if (!d) continue;
+    const g = byDay[d] || (byDay[d] = { date: d, pax: 0, eng: 0, att: 0, sess: 0 });
+    g.pax += (s.passersby || 0); g.eng += (s.engaged || 0);
+    g.att += (s.attention_s || 0); g.sess += 1;
+  }
+  let days = Object.values(byDay).sort((a, b) => a.date < b.date ? -1 : 1);
+  if (clientDays > 0) days = days.slice(-clientDays);
+  const pax = days.reduce((a, d) => a + d.pax, 0);
+  const eng = days.reduce((a, d) => a + d.eng, 0);
+  const att = days.reduce((a, d) => a + d.att, 0);
+  const sess = days.reduce((a, d) => a + d.sess, 0);
+  const fmt = (n) => n.toLocaleString("es-ES");
+  $("cpPax").textContent = fmt(pax);
+  $("cpEng").textContent = fmt(eng);
+  $("cpRate").textContent = (pax ? Math.round(eng / pax * 100) : 0) + "%";
+  $("cpAtt").textContent = Math.round(att / 60) + "m";
+  $("cpDays").textContent = days.length ? `${days.length} día(s) con actividad` : "sin datos";
+  $("cpSess").textContent = sess + " sesión(es)";
+  $("cpEmpty").style.display = days.length ? "none" : "block";
+  drawClientBars(days);
+  drawClientRate(days);
+}
+
+function drawClientBars(days) {
+  const cv = $("cpBars");
+  cv.__redraw = () => drawClientBars(days);
+  const { c, W, H } = hidpi(cv, 0.46), padL = 34, padR = 12, padT = 12, padB = 26;
+  if (!days.length) return;
+  const maxV = Math.max(1, ...days.map((d) => d.pax));
+  const n = days.length, gw = (W - padL - padR) / n, bw = Math.min(16, gw * 0.34);
+  const Y = (v) => (H - padB) - (v / maxV) * (H - padT - padB);
+  c.font = "10px system-ui, -apple-system, sans-serif";
+  for (let g = 0; g <= 4; g++) {
+    const v = maxV * g / 4, y = Y(v);
+    c.strokeStyle = "#efeae0"; c.lineWidth = 1; c.beginPath(); c.moveTo(padL, y); c.lineTo(W - padR, y); c.stroke();
+    c.fillStyle = "#9a9488"; c.textAlign = "right"; c.textBaseline = "middle"; c.fillText(Math.round(v), padL - 5, y);
+  }
+  days.forEach((d, i) => {
+    const cx = padL + gw * i + gw / 2;
+    c.fillStyle = "#d8d3c8"; c.fillRect(cx - bw - 1, Y(d.pax), bw, (H - padB) - Y(d.pax));
+    c.fillStyle = "#4a2a86"; c.fillRect(cx + 1, Y(d.eng), bw, (H - padB) - Y(d.eng));
+    c.fillStyle = "#9a9488"; c.font = "9.5px system-ui"; c.textAlign = "center"; c.textBaseline = "top";
+    c.fillText(d.date.slice(5), cx, H - padB + 5);
+  });
+}
+
+function drawClientRate(days) {
+  const cv = $("cpRateLine");
+  cv.__redraw = () => drawClientRate(days);
+  const { c, W, H } = hidpi(cv, 0.7), padL = 32, padR = 10, padT = 10, padB = 22;
+  if (!days.length) return;
+  const rate = days.map((d) => d.pax ? d.eng / d.pax * 100 : 0);
+  const maxV = Math.max(20, ...rate);
+  const X = (i) => days.length === 1 ? padL + (W - padL - padR) / 2 : padL + i * (W - padL - padR) / (days.length - 1);
+  const Y = (v) => (H - padB) - (v / maxV) * (H - padT - padB);
+  c.font = "10px system-ui, -apple-system, sans-serif";
+  for (let g = 0; g <= 4; g++) {
+    const v = maxV * g / 4, y = Y(v);
+    c.strokeStyle = "#efeae0"; c.lineWidth = 1; c.beginPath(); c.moveTo(padL, y); c.lineTo(W - padR, y); c.stroke();
+    c.fillStyle = "#9a9488"; c.textAlign = "right"; c.textBaseline = "middle"; c.fillText(Math.round(v) + "%", padL - 4, y);
+  }
+  c.fillStyle = "rgba(74,42,134,.10)"; c.beginPath(); c.moveTo(X(0), Y(0));
+  rate.forEach((v, i) => c.lineTo(X(i), Y(v))); c.lineTo(X(rate.length - 1), Y(0)); c.closePath(); c.fill();
+  c.strokeStyle = "#4a2a86"; c.lineWidth = 2; c.beginPath();
+  rate.forEach((v, i) => { const x = X(i), y = Y(v); i ? c.lineTo(x, y) : c.moveTo(x, y); }); c.stroke();
+  c.fillStyle = "#4a2a86";
+  rate.forEach((v, i) => { c.beginPath(); c.arc(X(i), Y(v), 2.5, 0, 7); c.fill(); });
+}
 
 // ---- CSV exports (server already persists live; these are a local copy) ----
 $("rExportEng").onclick = () => {
   const cols = ["yaw", "pitch", "distance", "label", "distance_tier", "glasses", "headwear",
                 "subject", "collector", "session", "captured_at"];
   const rows = [cols.join(",")];
-  const collector = $("collector").value || "unknown";
+  const collector = $("collector").value;
+  const glasses = ($("mGlasses") && $("mGlasses").value) || "unknown";
+  const headwear = ($("mHeadwear") && $("mHeadwear").value) || "unknown";
+  const subject = ($("mSubject") && $("mSubject").value.trim()) || "unknown";
   const session = "live_" + Date.now();
   const at = new Date().toISOString();
   for (const fr of frames) {
@@ -2546,35 +2881,10 @@ $("rExportEng").onclick = () => {
       const lab = gaze[pKey(fr, p.id)];
       if (!lab || p.yaw == null) continue;
       rows.push([p.yaw, p.pitch, p.distance, lab === "look" ? 1 : 0, p.tier || tierFor(p.distance),
-                 "unknown", "unknown", "unknown", collector, session, at].join(","));
+                 glasses, headwear, subject, collector, session, at].join(","));
     }
   }
   download(rows.join("\\n"), "live_session_reviewed.csv");
-};
-
-$("rExportDet").onclick = () => {
-  const cols = ["frame_idx", "track_id", "x1", "y1", "x2", "y2", "conf", "verdict",
-                "collector", "session", "captured_at"];
-  const rows = [cols.join(",")];
-  const collector = $("collector").value || "unknown";
-  const session = "live_" + Date.now();
-  const at = new Date().toISOString();
-  for (const fr of frames) {
-    for (const p of fr.people) {
-      const k = pKey(fr, p.id);
-      let verdict = null;
-      if (det[k] === "notperson") verdict = 0;
-      else if (det[k] === "real" || gaze[k]) verdict = 1;
-      if (verdict === null) continue;
-      rows.push([fr.i, p.id, p.box[0], p.box[1], p.box[2], p.box[3], p.conf ?? "", verdict,
-                 collector, session, at].join(","));
-    }
-    for (const m of manualList(fr)) {
-      rows.push([fr.i, m.mid, m.box[0], m.box[1], m.box[2], m.box[3], "", 1,
-                 collector, session, at].join(","));
-    }
-  }
-  download(rows.join("\\n"), "live_session_detections.csv");
 };
 
 function download(text, name) {
@@ -2616,21 +2926,100 @@ $("rFinish").onclick = () => finishSession($("rFinish"));
 $("anFinish").onclick = () => finishSession($("anFinish"));
 $("anBack").onclick = () => showScreen("layout");
 
+// Clicking the VisionMetrics logo always returns to the main (start) screen. If a
+// session is live or under review, close it cleanly first (restart + reset) so the
+// next Start begins fresh; otherwise just show the start screen.
+function goHome() {
+  if (started || stopped) finishSession(null);
+  else showScreen("start");
+}
+
 // ================= PHASE 3 — model check (analysis) =================
 // Eval set = every DETECTED person that both carries a model prediction
 // (p_look, the live pipeline's engage_prob) AND that you labeled looking /
 // not looking. That pairing (predicted probability vs your ground truth) is
 // what every metric below reads.
 let anPairs = [];
+let anCal = null;   // last calibration() result, kept for redraw on resize
 function evalPairs() {
   const pairs = [];
   for (const f of frames) for (const p of f.people) {
     if (p.p_look === undefined || p.p_look === null) continue;
     const g = gaze[pKey(f, p.id)];
     if (g !== "look" && g !== "away") continue;
-    pairs.push({ s: p.p_look, y: g === "look" ? 1 : 0 });
+    pairs.push({ s: p.p_look, y: g === "look" ? 1 : 0, tier: p.tier || tierFor(p.distance) });
   }
   return pairs;
+}
+
+// ---- extra model-quality reads (threshold-independent) --------------------
+// Log loss (binary cross-entropy): punishes confident wrong probabilities much
+// harder than Brier — the sharpest single number for a probabilistic classifier.
+function logLoss(pairs) {
+  if (!pairs.length) return NaN;
+  const e = 1e-7;
+  let s = 0;
+  for (const { s: p, y } of pairs) {
+    const q = Math.min(1 - e, Math.max(e, p));
+    s += y ? -Math.log(q) : -Math.log(1 - q);
+  }
+  return s / pairs.length;
+}
+// Calibration: bin predictions into deciles, compare mean predicted prob to the
+// actual look-rate in each bin. ECE = sample-weighted mean gap (0 = perfectly
+// calibrated). Returns {ece, bins:[{lo,hi,pMean,yRate,n}]}.
+function calibration(pairs, nbins = 10) {
+  const bins = Array.from({ length: nbins }, (_, i) => ({ lo: i / nbins, hi: (i + 1) / nbins, ps: 0, ys: 0, n: 0 }));
+  for (const { s, y } of pairs) {
+    let bi = Math.min(nbins - 1, Math.floor(s * nbins));
+    if (bi < 0) bi = 0;
+    bins[bi].ps += s; bins[bi].ys += y; bins[bi].n += 1;
+  }
+  let ece = 0;
+  const out = bins.map((b) => {
+    const pMean = b.n ? b.ps / b.n : null, yRate = b.n ? b.ys / b.n : null;
+    if (b.n) ece += (b.n / pairs.length) * Math.abs(pMean - yRate);
+    return { lo: b.lo, hi: b.hi, pMean, yRate, n: b.n };
+  });
+  return { ece: pairs.length ? ece : NaN, bins: out };
+}
+// Sweep every candidate threshold and return the ones that maximise Youden's J
+// (TPR−FPR, the balanced-cost optimum) and F1 (precision/recall balance). These
+// give the operator a one-click "good place to put the line" instead of guessing.
+function bestThresholds(pairs) {
+  const P = pairs.reduce((a, p) => a + p.y, 0), N = pairs.length - P;
+  if (!P || !N) return { youden: NaN, f1: NaN };
+  const cand = [...new Set(pairs.map((p) => p.s))].sort((a, b) => a - b);
+  let bestJ = -1, tJ = 0.5, bestF = -1, tF = 0.5;
+  for (const t of cand) {
+    const { tp, fp, fn, tn } = confAt(pairs, t);
+    const tpr = tp / (tp + fn || 1), fpr = fp / (fp + tn || 1);
+    const j = tpr - fpr;
+    if (j > bestJ) { bestJ = j; tJ = t; }
+    const prec = tp / (tp + fp || 1), rec = tp / (tp + fn || 1);
+    const f1 = (prec + rec) ? 2 * prec * rec / (prec + rec) : 0;
+    if (f1 > bestF) { bestF = f1; tF = t; }
+  }
+  return { youden: tJ, f1: tF };
+}
+// Per-distance-tier accuracy at the current threshold — surfaces whether the
+// model quietly falls apart on far-away faces (small, noisy pose), which the
+// single global accuracy hides.
+function tierBreakdown(pairs, t) {
+  const order = ["near", "mid", "far", "v-far"];
+  const groups = {};
+  for (const p of pairs) {
+    const key = (p.tier || "").split(" ")[0] || "?";
+    (groups[key] || (groups[key] = [])).push(p);
+  }
+  const rows = [];
+  for (const key of order) {
+    const g = groups[key]; if (!g || !g.length) continue;
+    const { tp, tn } = confAt(g, t);
+    rows.push({ tier: key, n: g.length, acc: (tp + tn) / g.length,
+                looked: g.reduce((a, p) => a + p.y, 0) });
+  }
+  return rows;
 }
 
 // ROC by sweeping every score as a threshold; AUC by trapezoid over (FPR, TPR).
@@ -2713,7 +3102,7 @@ function hideTip() { chartTip().style.display = "none"; }
 function redrawChart(cv) { if (cv && cv.__redraw) cv.__redraw(); }
 function redrawAnalysisCharts() {
   if ($("analysis").style.display === "none") return;
-  ["rocCanvas", "prCanvas", "perfCanvas", "trendCanvas", "rocCmpCanvas", "trainBarCanvas"]
+  ["rocCanvas", "prCanvas", "calCanvas", "perfCanvas", "trendCanvas", "rocCmpCanvas", "trainBarCanvas"]
     .forEach((id) => redrawChart($(id)));
 }
 
@@ -2754,6 +3143,43 @@ function plotCurveCore(cv, pts, diag, pts2) {
   };
   line(pts, "#4a2a86", 2.2);     // current / primary model
   line(pts2, "#0bb3a6", 2.2);    // candidate (only when comparing)
+}
+
+// Reliability diagram: for each confidence decile, plot mean predicted prob (x)
+// against the ACTUAL look-rate in that bin (y). Perfect calibration hugs the
+// diagonal — bars above it = the model is under-confident, below = over-confident.
+function drawReliability(cv, cal) {
+  cv.__redraw = () => drawReliability(cv, cal);
+  const { c, W, H } = hidpi(cv, 1), pad = 34;
+  const X = (x) => pad + x * (W - 2 * pad), Y = (y) => (H - pad) - y * (H - 2 * pad);
+  c.font = "10px system-ui, -apple-system, sans-serif";
+  for (let g = 0; g <= 1.0001; g += 0.25) {
+    c.strokeStyle = "#efeae0"; c.lineWidth = 1;
+    c.beginPath(); c.moveTo(X(g), Y(0)); c.lineTo(X(g), Y(1)); c.stroke();
+    c.beginPath(); c.moveTo(X(0), Y(g)); c.lineTo(X(1), Y(g)); c.stroke();
+    c.fillStyle = "#9a9488";
+    c.textAlign = "center"; c.textBaseline = "top"; c.fillText(g.toFixed(2), X(g), H - pad + 4);
+    c.textAlign = "right"; c.textBaseline = "middle"; c.fillText(g.toFixed(2), pad - 5, Y(g));
+  }
+  c.strokeStyle = "#c9c2b4"; c.lineWidth = 1.2; c.strokeRect(pad, pad, W - 2 * pad, H - 2 * pad);
+  c.strokeStyle = "#c9c2b4"; c.setLineDash([4, 4]);   // ideal-calibration diagonal
+  c.beginPath(); c.moveTo(X(0), Y(0)); c.lineTo(X(1), Y(1)); c.stroke(); c.setLineDash([]);
+  if (!cal || !cal.bins) return;
+  const filled = cal.bins.filter((b) => b.n);
+  const maxN = Math.max(1, ...filled.map((b) => b.n));
+  // dot per bin: x = mean predicted, y = observed rate, size ∝ sample count
+  const pts = [];
+  for (const b of filled) {
+    const px = X(b.pMean), py = Y(b.yRate);
+    const rr = 3 + 5 * Math.sqrt(b.n / maxN);
+    c.fillStyle = "rgba(74,42,134,.18)"; c.beginPath(); c.arc(px, py, rr, 0, 7); c.fill();
+    c.fillStyle = "#4a2a86"; c.beginPath(); c.arc(px, py, 3, 0, 7); c.fill();
+    pts.push([px, py]);
+  }
+  if (pts.length > 1) {   // connect the observed-rate points
+    c.strokeStyle = "#4a2a86"; c.lineWidth = 2; c.lineJoin = "round"; c.beginPath();
+    pts.forEach(([x, y], i) => i ? c.lineTo(x, y) : c.moveTo(x, y)); c.stroke();
+  }
 }
 function bindCurveHover(cv) {
   if (cv.__hoverBound) return; cv.__hoverBound = true;
@@ -2796,6 +3222,24 @@ function renderConfusion() {
   const base = anPairs.length ? (tp + fn) / anPairs.length : NaN;
   $("mMcc").textContent = fmt(mcc); $("mBalAcc").textContent = fmt(balAcc);
   $("mBase").textContent = isNaN(base) ? "—" : Math.round(base * 100) + "%";
+  $("mSpec").textContent = fmt(tnr);   // specificity moves with the threshold too
+  renderTierTable(t);
+}
+
+// Per-distance-tier accuracy at the current threshold. Green when the model holds
+// up on that tier, red when it slips — so you can SEE that far/tiny faces are the
+// weak spot, which the single global accuracy number hides.
+function renderTierTable(t) {
+  const rows = tierBreakdown(anPairs, t);
+  if (!rows.length) { $("tierTable").innerHTML = ""; $("tierEmpty").style.display = "block"; return; }
+  $("tierEmpty").style.display = "none";
+  $("tierTable").innerHTML =
+    `<table class="tier"><thead><tr><th>Distance</th><th>n</th><th>Looked</th><th>Accuracy</th></tr></thead><tbody>` +
+    rows.map((r) => {
+      const cls = r.acc >= 0.8 ? "hi" : (r.acc < 0.6 ? "lo" : "");
+      return `<tr><td>${r.tier}</td><td>${r.n}</td><td>${r.looked}</td>` +
+             `<td class="${cls}">${Math.round(r.acc * 100)}%</td></tr>`;
+    }).join("") + `</tbody></table>`;
 }
 
 function runAnalysis() {
@@ -2813,6 +3257,18 @@ function runAnalysis() {
   $("prCap").textContent = `Precision–Recall — AP ${isNaN(pr.ap) ? "n/a" : pr.ap.toFixed(3)}  ·  x=recall, y=precision`;
   $("mAuc").textContent = isNaN(roc.auc) ? "—" : roc.auc.toFixed(2);
   $("mBrier").textContent = isNaN(brier) ? "—" : brier.toFixed(3);
+  // Threshold-independent extras: log loss (sharpness) + ECE (calibration).
+  const ll = logLoss(anPairs);
+  anCal = calibration(anPairs);
+  $("mLogloss").textContent = isNaN(ll) ? "—" : ll.toFixed(3);
+  $("mEce").textContent = isNaN(anCal.ece) ? "—" : anCal.ece.toFixed(3);
+  drawReliability($("calCanvas"), anCal);
+  // Suggested operating points — one click drops the slider on the best line.
+  const bt = bestThresholds(anPairs);
+  $("chipYouden").textContent = "Youden-J " + (isNaN(bt.youden) ? "—" : bt.youden.toFixed(2));
+  $("chipF1").textContent = "F1-max " + (isNaN(bt.f1) ? "—" : bt.f1.toFixed(2));
+  $("chipYouden").onclick = () => { if (!isNaN(bt.youden)) { $("thSlider").value = bt.youden; renderConfusion(); } };
+  $("chipF1").onclick = () => { if (!isNaN(bt.f1)) { $("thSlider").value = bt.f1; renderConfusion(); } };
   let note;
   if (!anyPred) note = "No model predictions in these frames — nothing to score.";
   else if (anPairs.length < 20) note = "Very few samples — label more for a trustworthy read.";
@@ -2933,36 +3389,6 @@ function renderCompare(items, oldS, newS) {
 }
 
 $("bRetrain").onclick = runRetrain;
-
-// ---- fine-tune the YOLO person detector on this session's detection verdicts ----
-let yoloTimer = null;
-async function runYolo() {
-  const epochs = Math.max(1, Math.min(200, parseInt($("yoloEpochs").value, 10) || 20));
-  $("bYolo").disabled = true;
-  $("yoloStatus").textContent = "Starting…";
-  try {
-    const r = await (await fetch("/api/finetune_yolo", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ epochs }),
-    })).json();
-    if (!r.ok) { $("yoloStatus").textContent = r.msg || "Could not start."; $("bYolo").disabled = false; return; }
-  } catch (e) { $("yoloStatus").textContent = "Could not reach the server."; $("bYolo").disabled = false; return; }
-  pollYolo();
-}
-
-function pollYolo() {
-  clearTimeout(yoloTimer);
-  yoloTimer = setTimeout(async () => {
-    let s;
-    try { s = await (await fetch("/api/finetune_yolo_status", { cache: "no-store" })).json(); }
-    catch (e) { $("yoloStatus").textContent = "Lost contact with the trainer."; $("bYolo").disabled = false; return; }
-    $("yoloStatus").textContent = s.msg || "";
-    if (s.log) $("yoloLog").textContent = s.log;
-    if (s.running) { pollYolo(); return; }
-    $("bYolo").disabled = false;
-  }, 1500);
-}
-$("bYolo").onclick = runYolo;
 
 $("bPromote").onclick = async () => {
   $("bPromote").disabled = true;
@@ -3189,6 +3615,41 @@ async function loadTrainingData() {
       `<th style="text-align:right;">Share</th></tr></thead><tbody>${rows}</tbody></table>`;
   }
   drawTrainBars(bars);
+  renderCoverage(s.coverage, s.tier_order);
+}
+
+// Coverage grid: distance tier × looking/not-looking. The whole point is to make
+// "wasted data" visible — a cell the model has barely seen (or seen only one
+// class of) is where it will guess, so those cells are flagged for you to fill.
+// Thresholds are deliberately simple: <8 rows = thin (red), <20 = light (amber),
+// else healthy (green). A tier with looking but no not-looking (or vice-versa)
+// is always red — one-sided data teaches the model nothing useful there.
+const TIER_LABEL = { near: "Near <0.5m", mid: "Mid 0.5–1.5m", far: "Far 1.5–3.5m", "v-far": "Very far >3.5m" };
+function covClass(n, oneSided) {
+  if (oneSided || n < 8) return "bad";
+  if (n < 20) return "warn";
+  return "ok";
+}
+function renderCoverage(cov, order) {
+  const box = $("coverageTable");
+  if (!cov || !order) { box.innerHTML = ""; return; }
+  let tl = 0, ta = 0;
+  const rows = order.map((t) => {
+    const c = cov[t] || { look: 0, away: 0 };
+    const look = c.look || 0, away = c.away || 0, tot = look + away;
+    tl += look; ta += away;
+    const lookCls = covClass(look, tot > 0 && away === 0);
+    const awayCls = covClass(away, tot > 0 && look === 0);
+    return `<tr><td>${TIER_LABEL[t] || t}</td>` +
+           `<td class="cell ${lookCls}">${look}</td>` +
+           `<td class="cell ${awayCls}">${away}</td>` +
+           `<td>${tot}</td></tr>`;
+  }).join("");
+  box.innerHTML =
+    `<table class="cov"><thead><tr><th>Distance</th>` +
+    `<th>Looking</th><th>Not looking</th><th>Total</th></tr></thead>` +
+    `<tbody>${rows}</tbody>` +
+    `<tfoot><tr><td>All</td><td>${tl}</td><td>${ta}</td><td>${tl + ta}</td></tr></tfoot></table>`;
 }
 
 function drawTrainBars(bars) {

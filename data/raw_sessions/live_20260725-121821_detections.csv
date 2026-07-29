@@ -1,3 +1,0 @@
-frame_idx,track_id,x1,y1,x2,y2,conf,verdict,collector,session,captured_at
-220,1,379,104,634,356,,1,unknown,live_20260725-121821,2026-07-25T10:19:53.689056+00:00
-438,1,148,23,447,356,,1,unknown,live_20260725-121821,2026-07-25T10:20:03.449980+00:00

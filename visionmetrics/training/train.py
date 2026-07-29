@@ -74,6 +74,15 @@ def main() -> int:
 
     torch.manual_seed(a.seed)
     model = EngagementNet()
+    # Fit the input z-score on the TRAIN set only (never the test set) and store it
+    # INSIDE the model (buffers -> saved in the .pth). forward() then standardizes
+    # automatically, so train, eval and the live agent all apply the identical
+    # transform to raw (yaw, pitch, distance) — no train/serve skew, no side file.
+    feat_mean = X_train.mean(axis=0)
+    feat_std = X_train.std(axis=0)
+    model.set_standardization(feat_mean, feat_std)
+    print(f"[train] input z-score  mean={np.round(feat_mean, 4).tolist()}  "
+          f"std={np.round(feat_std, 4).tolist()}")
     loss_fn = nn.BCELoss()
     opt = optim.Adam(model.parameters(), lr=a.lr)
     loader = DataLoader(
@@ -104,6 +113,9 @@ def main() -> int:
           f"precision {overall['precision']}  recall {overall['recall']}  (n={len(y_test)})")
 
     report = {"data": path, "n_train": int(len(X_train)), "n_test": int(len(X_test)),
+              "standardization": {"features": dataset.FEATURES,
+                                  "mean": np.round(feat_mean, 6).tolist(),
+                                  "std": np.round(feat_std, 6).tolist()},
               "overall": overall, "by": {}}
     ev = test_df.copy()
     ev["true"] = y_test

@@ -45,7 +45,7 @@ vision:
 engagement:
   frame_buffer_size: 3
   frame_engage_min: 1               # engaged frames (of the last N) to be "looking"; raise to 2 to be stricter
-  count_threshold_s: 2.0            # attention before counting as "engaged"
+  count_threshold_s: 3.0            # attention (s) of looking before counting as "engaged"
   zone_soft_margin: 0.30            # width of the soft engagement-zone edge
   min_engage_window_s: 0.4          # discard looking windows shorter than this (anti-flicker: shadows, brief glances)
 

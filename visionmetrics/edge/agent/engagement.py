@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 class EngagementParams:
     frame_buffer_size: int = 3          # look at the last N frames
     frame_engage_min: int = 1           # >= this many engaged frames in the buffer => engaged
-    count_threshold_s: float = 2.0      # attention before a person counts as "engaged"
+    count_threshold_s: float = 3.0      # attention (s) before a person counts as "engaged"
     zone_soft_margin: float = 0.30      # width of the soft engagement-zone edge (used by pipeline)
     # Anti-flicker: a looking window shorter than this (seconds) is discarded when
     # it closes, instead of being banked. Stops sub-second glances/noise (a shadow,
