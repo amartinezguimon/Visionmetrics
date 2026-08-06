@@ -24,7 +24,20 @@ DEFAULT_OUTPUT = "data/engagement_dataset.csv"
 
 
 def gather_inputs(sessions_dir: str, legacy: str | None) -> list[str]:
-    paths = sorted(str(p) for p in Path(sessions_dir).glob("*.csv"))
+    """Every per-session engagement CSV in ``sessions_dir``, plus the legacy file.
+
+    The live web dashboard (``edge/agent/webserver.py``) writes TWO files per
+    session into this folder: ``live_<stamp>.csv`` (yaw/pitch/distance/label —
+    what this dataset needs) and ``live_<stamp>_detections.csv`` (raw detector
+    boxes, a separate schema used only by the YOLO fine-tuning pipeline in
+    ``training/detector/``). Reading both here crashes ``dataset.normalize``
+    (the detections file has no yaw/pitch/label columns), so the sibling file is
+    excluded explicitly rather than relied on to "just not match" some pattern.
+    """
+    paths = sorted(
+        str(p) for p in Path(sessions_dir).glob("*.csv")
+        if not p.name.endswith("_detections.csv")
+    )
     if legacy and Path(legacy).exists():
         paths.append(legacy)
     return paths

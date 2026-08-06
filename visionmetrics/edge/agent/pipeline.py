@@ -162,7 +162,7 @@ class EngagementPipeline:
             if seen < self.passerby_min_frames:
                 continue
 
-            pose = self.head_pose.analyze(frame, det.bbox, tid, frame_idx, self._focal_px)
+            pose = self.head_pose.analyze(frame, det.bbox, tid, frame_idx, self._focal_px, now)
             if pose is not None:
                 self._face_seen.add(tid)
 

@@ -40,7 +40,7 @@ class FakeHeadPose:
         self._pose = pose
         self.forgotten = []
 
-    def analyze(self, frame, bbox, tid, frame_idx, focal_px):
+    def analyze(self, frame, bbox, tid, frame_idx, focal_px, now):
         return self._pose
 
     def forget(self, tid):
@@ -58,7 +58,7 @@ class FakeHeadPoseSequence:
         self._none_for = none_for
         self._calls = 0
 
-    def analyze(self, frame, bbox, tid, frame_idx, focal_px):
+    def analyze(self, frame, bbox, tid, frame_idx, focal_px, now):
         self._calls += 1
         return None if self._calls <= self._none_for else self._pose
 

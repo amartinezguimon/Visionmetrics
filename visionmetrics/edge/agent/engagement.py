@@ -22,7 +22,13 @@ class EngagementParams:
     frame_buffer_size: int = 3          # look at the last N frames
     frame_engage_min: int = 1           # >= this many engaged frames in the buffer => engaged
     count_threshold_s: float = 3.0      # attention (s) before a person counts as "engaged"
-    zone_soft_margin: float = 0.30      # width of the soft engagement-zone edge (used by pipeline)
+    # Width of the soft engagement-zone edge (used by pipeline/zone_confidence), in
+    # DEGREES — yaw/pitch changed from a unitless 2D ratio to a real solvePnP angle
+    # (see geometry.py), a completely different numeric scale. 15 degrees is a
+    # reasoned starting tolerance (roughly "a noticeable but small extra head turn
+    # at the zone boundary"), not yet validated against real calibration data —
+    # re-tune once a store has real recorded sessions to check it against.
+    zone_soft_margin: float = 15.0
     # Anti-flicker: a looking window shorter than this (seconds) is discarded when
     # it closes, instead of being banked. Stops sub-second glances/noise (a shadow,
     # a head that briefly clips "looking") from accumulating toward the count.

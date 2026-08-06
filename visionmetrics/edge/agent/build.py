@@ -10,7 +10,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from .classifier import EngagementClassifier
+from .classifier import CURRENT_FEATURE_SCHEMA, EngagementClassifier
 from .config import DeviceConfig
 from .models_bootstrap import ensure_models
 from .pipeline import EngagementPipeline
@@ -65,6 +65,15 @@ def build_pipeline(config: DeviceConfig) -> EngagementPipeline:
         min_visibility=v.torso_min_visibility, skip_frames=v.pose_skip_frames,
     )
     classifier = EngagementClassifier.load(config.models.engagement)
+    if classifier.feature_schema != CURRENT_FEATURE_SCHEMA:
+        print(
+            f"[build] *** AVISO IMPORTANTE ***  {config.models.engagement} se entrenó con "
+            f"la definición de características antigua (schema {classifier.feature_schema}), "
+            f"pero este código calcula yaw/pitch con la nueva (schema {CURRENT_FEATURE_SCHEMA}, "
+            f"solvePnP en grados — ver geometry.py). Las predicciones de este modelo NO SON "
+            f"FIABLES hasta reentrenar con datos recogidos con el pipeline actual. "
+            f"Ejecuta build_dataset + train tras recopilar sesiones nuevas."
+        )
     return EngagementPipeline(
         detector=detector, head_pose=head_pose, torso=torso, classifier=classifier,
         zone=load_zone(config),

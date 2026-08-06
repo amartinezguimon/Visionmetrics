@@ -12,6 +12,16 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
+# Bumped whenever what (yaw, pitch, distance) MEANS changes in a way that makes
+# old weights numerically meaningless against new inputs, or vice versa (see
+# geometry.py's "BREAKING CHANGE" note on the solvePnP switch). Every model
+# checkpoint carries the schema it was TRAINED under (see `feature_schema`
+# below); `build.py` compares that against this constant at load time and
+# warns loudly on a mismatch instead of silently serving garbage predictions.
+#   1 = the original flat 2D ratio yaw/pitch (pre-solvePnP).
+#   2 = real solvePnP angles in degrees, One-Euro-filtered (this version).
+CURRENT_FEATURE_SCHEMA = 2
+
 
 class EngagementNet(nn.Module):
     """MLP: (yaw, pitch, face_width_norm) -> P(engaged) in [0, 1].
@@ -29,6 +39,11 @@ class EngagementNet(nn.Module):
         super().__init__()
         self.register_buffer("feat_mean", torch.zeros(3))
         self.register_buffer("feat_std", torch.ones(3))
+        # Defaults to schema 1 (the ORIGINAL feature definition): a checkpoint
+        # saved before this buffer existed loads via strict=False and simply
+        # keeps this default, which correctly marks it as schema 1 rather than
+        # being silently miscategorised as "current".
+        self.register_buffer("feature_schema", torch.tensor(1.0))
         self.network = nn.Sequential(
             nn.Linear(3, 16), nn.ReLU(),
             nn.Linear(16, 8), nn.ReLU(),
@@ -44,6 +59,9 @@ class EngagementNet(nn.Module):
         self.feat_mean.copy_(m)
         self.feat_std.copy_(s)
 
+    def set_feature_schema(self, schema: int) -> None:
+        self.feature_schema.fill_(float(schema))
+
     def forward(self, x):
         x = (x - self.feat_mean) / self.feat_std
         return self.network(x)
@@ -55,6 +73,12 @@ class EngagementClassifier:
     def __init__(self, model: EngagementNet):
         self._model = model
         self._model.eval()
+
+    @property
+    def feature_schema(self) -> int:
+        """Which feature definition (see `CURRENT_FEATURE_SCHEMA`) this loaded
+        model was trained under."""
+        return int(round(self._model.feature_schema.item()))
 
     @classmethod
     def load(cls, weights_path: str | Path) -> "EngagementClassifier":

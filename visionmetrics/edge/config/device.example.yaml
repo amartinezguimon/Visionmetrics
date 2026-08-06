@@ -14,13 +14,18 @@ camera:
   #   an RTSP url         -> "rtsp://user:pass@192.168.1.50:554/stream"  (IP camera)
   #   a file path         -> "fixtures/clip.mp4"  (for offline testing)
   source: 0
-  fov_h_deg: 70.0                   # horizontal field of view of THIS camera (critical for distance)
+  # Horizontal FOV of THIS camera, in degrees — critical for distance AND (since
+  # solvePnP) for the angle estimate itself. Get this from the camera's own spec
+  # sheet, and make sure it's the HORIZONTAL figure, not the diagonal one
+  # manufacturers often publish instead — a diagonal FOV plugged in here as if it
+  # were horizontal gives confidently WRONG angles, not just noisy ones.
+  fov_h_deg: 70.0
   reconnect_delay_s: 2.0            # wait between reconnect attempts if the stream drops
 
 vision:
-  face_width_m: 0.16                # assumed real adult face width (pinhole model)
+  face_width_m: 0.16                # assumed real adult face width (pinhole model AND the solvePnP face-size assumption)
   yolo_conf_min: 0.45               # reject weak person detections
-  aspect_ratio_min: 0.75            # height/width floor (people are taller than wide)
+  aspect_ratio_min: 0.4             # height/width floor; low enough to keep head-and-shoulders boxes in a crowd
   # Passerby (foot-traffic) counting: count a track as a real person once it has
   # persisted AND either moved or shown a face. Rejects flicker + static furniture.
   passerby_min_frames: 8            # frames a box must persist before it can count
@@ -29,10 +34,12 @@ vision:
                                     #   (too far to be a customer). 0 = off; ~0.15 in a store
                                     #   with a transverse street. Complements the counting zone.
   head_crop_frac: 0.45              # top fraction of the person bbox treated as the head
-  head_upscale: 4                   # upscale factor on the head crop (enables 4 m+ detection)
-  face_skip_frames: 3               # run MediaPipe face every N frames per person
+  head_upscale: 4                   # MAX upscale factor on the head crop (auto-capped for
+                                    #   already-large/close crops — see vision/face.py upscale_factor)
+  face_skip_frames: 5               # run MediaPipe face every N frames per person (widened — the
+                                    #   per-person cost with a crowd is the real bottleneck, not the detector)
   pose_enabled: true
-  pose_skip_frames: 8               # run MediaPipe pose every N frames per person
+  pose_skip_frames: 12              # run MediaPipe pose every N frames per person
   torso_neutral_span: 0.40          # shoulder span when squarely facing the camera
   torso_min_visibility: 0.40        # min landmark visibility to trust the pose result
   # Anti double-count when the tracker briefly loses a person and re-detects them
@@ -46,7 +53,7 @@ engagement:
   frame_buffer_size: 3
   frame_engage_min: 1               # engaged frames (of the last N) to be "looking"; raise to 2 to be stricter
   count_threshold_s: 3.0            # attention (s) of looking before counting as "engaged"
-  zone_soft_margin: 0.30            # width of the soft engagement-zone edge
+  zone_soft_margin: 15.0            # width of the soft engagement-zone edge, in DEGREES (yaw/pitch are real solvePnP angles now, not a 2D ratio)
   min_engage_window_s: 0.4          # discard looking windows shorter than this (anti-flicker: shadows, brief glances)
 
 models:

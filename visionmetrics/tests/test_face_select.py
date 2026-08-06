@@ -1,9 +1,10 @@
-"""Tests for most_centred_face — picking the right face when two are in a crop."""
+"""Tests for most_centred_face — picking the right face when two are in a crop
+— and upscale_factor, the per-frame compute-saving cap on head-crop upscaling."""
 
 from __future__ import annotations
 
 from visionmetrics.edge.agent import geometry
-from visionmetrics.edge.agent.vision.face import most_centred_face
+from visionmetrics.edge.agent.vision.face import most_centred_face, upscale_factor
 
 
 class _LM:
@@ -35,3 +36,33 @@ def test_ties_keep_the_first():
     a = _face(0.4)
     b = _face(0.6)            # equidistant from 0.5
     assert most_centred_face([a, b]) is a
+
+
+# ── upscale_factor ───────────────────────────────────────────────────────
+
+def test_small_far_crop_gets_the_full_configured_factor():
+    # A tiny ~30px crop is nowhere near the target cap — unchanged behaviour.
+    assert upscale_factor(30, 30, head_upscale=4, target_px=220) == 4.0
+
+
+def test_large_close_crop_is_barely_upscaled():
+    # A crop already bigger than the target needs no real upscaling at all —
+    # this is the actual compute saved for close-up people in a crowd.
+    f = upscale_factor(300, 300, head_upscale=4, target_px=220)
+    assert 1.0 <= f < 1.1
+
+
+def test_mid_size_crop_scales_just_enough_to_reach_the_target():
+    f = upscale_factor(100, 80, head_upscale=4, target_px=220)
+    assert f == 2.2   # 220 / 100 (the longer side)
+
+
+def test_never_upscales_below_1x():
+    # A crop already larger than target_px even at head_upscale=1 must not be
+    # shrunk — 1.0 is the floor, never < 1.
+    assert upscale_factor(500, 400, head_upscale=4, target_px=220) == 1.0
+
+
+def test_degenerate_zero_size_roi_is_safe():
+    assert upscale_factor(0, 50, head_upscale=4) == 1.0
+    assert upscale_factor(50, 0, head_upscale=4) == 1.0

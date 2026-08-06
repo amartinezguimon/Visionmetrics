@@ -52,9 +52,16 @@ class VisionConfig:
     passerby_min_height_frac: float = 0.0
     head_crop_frac: float = 0.45
     head_upscale: int = 4
-    face_skip_frames: int = 3
+    # How many frames between re-running MediaPipe for the SAME person (cached
+    # in between). Widened from 3/8 — the real per-frame cost with a crowd is
+    # N people x (face + pose) inference, not the detector; re-analysing each
+    # person less often is a direct lever on that. A head doesn't turn fast
+    # enough for this gap to be felt, and the One-Euro filter (see one_euro.py)
+    # now smooths across it too. Re-tune from real multi-person footage if
+    # engagement ever feels laggy to react.
+    face_skip_frames: int = 5
     pose_enabled: bool = True
-    pose_skip_frames: int = 8
+    pose_skip_frames: int = 12
     torso_neutral_span: float = 0.40
     torso_min_visibility: float = 0.40
     # Tracking robustness (anti double-count on ByteTrack id switches):

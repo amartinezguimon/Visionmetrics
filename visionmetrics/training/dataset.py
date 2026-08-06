@@ -83,6 +83,74 @@ def load_csv(path: str | Path) -> pd.DataFrame:
     return normalize(pd.read_csv(path))
 
 
+_UNKNOWN_TOKENS = {"", "unknown", "nan", "none"}
+
+
+def group_key(df: pd.DataFrame) -> pd.Series:
+    """One identity per row for a leak-free train/test split: the real
+    ``subject`` when it was actually recorded, otherwise the ``session`` they
+    were collected in (a session is one sitting in front of one camera — almost
+    always one real person — even on rows where nobody typed a name in).
+
+    Why this matters: a plain row-level split lets different frames of the SAME
+    person land in both train and test. The model then has 3 numbers (yaw,
+    pitch, distance) that repeat with that person's own idiosyncrasies across
+    both piles, so it can partly "recognise" them rather than learning gaze in
+    general — inflating every reported metric. Grouping by identity keeps a
+    person's rows entirely on one side.
+
+    Never returns the bare literal "unknown" — that would silently collapse
+    every subject-less row onto one fake shared "person" and defeat the whole
+    point. Rows with neither a real subject nor a real session (the oldest,
+    barest legacy data) do still collapse together under one group; there is no
+    metadata left to tell those individuals apart, which is a genuine ceiling
+    of that data, not a bug in this function.
+    """
+    def _clean(col: str, prefix: str) -> pd.Series:
+        s = df[col].astype(str).str.strip()
+        known = ~s.str.lower().isin(_UNKNOWN_TOKENS)
+        return known, prefix + s
+
+    subj_known, subj_val = _clean("subject", "subject:")
+    sess_known, sess_val = _clean("session", "session:")
+    fallback = sess_val.where(sess_known, "legacy:no-metadata")
+    return subj_val.where(subj_known, fallback)
+
+
+def group_train_test_split(
+    df: pd.DataFrame, *, test_size: float = 0.2, seed: int = 42,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Train/test split with NO shared identity (see `group_key`) between the
+    two sides, keeping the label balance close to `test_size` when there are
+    enough distinct identities to do so.
+
+    Uses ``StratifiedGroupKFold`` (grouped AND label-aware) when there are
+    enough distinct groups for it to run; a dataset too small/thin for that
+    (say, a handful of people) falls back to a plain ``GroupShuffleSplit`` —
+    still zero leakage, just without the label-balance guarantee — rather than
+    raising on a small real-world dataset.
+    """
+    from sklearn.model_selection import GroupShuffleSplit, StratifiedGroupKFold
+
+    if not 0.0 < test_size < 1.0:
+        raise ValueError(f"test_size must be in (0, 1), got {test_size}")
+    labels = df["label"].to_numpy()
+    groups = group_key(df).to_numpy()
+    n_groups = len(set(groups))
+    n_splits = max(2, round(1.0 / test_size))
+
+    if n_groups < n_splits:
+        splitter = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
+        train_idx, test_idx = next(splitter.split(df, labels, groups))
+    else:
+        skf = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        train_idx, test_idx = next(skf.split(df, labels, groups))
+
+    train_df = df.iloc[train_idx].reset_index(drop=True)
+    test_df = df.iloc[test_idx].reset_index(drop=True)
+    return train_df, test_df
+
+
 def merge(paths: list[str | Path]) -> pd.DataFrame:
     """Read + normalise several CSVs and concatenate them into one dataset."""
     frames = [load_csv(p) for p in paths if Path(p).exists()]
@@ -112,7 +180,13 @@ def augment_far(X: np.ndarray, y: np.ndarray, *, scales=(0.6, 0.35, 0.15),
 def classification_metrics(y_true, y_pred) -> dict:
     """Accuracy (%), precision and recall for the positive ("looking") class.
 
-    Pure numpy; denominators guarded so a single-class slice never divides by zero.
+    `precision`/`recall` are ``None`` — NOT a misleading ``0.0`` — when there is
+    no support for the relevant class in this slice. E.g. the "far" distance
+    tier currently has zero REAL "looking" test rows: a bare 0.0 there would
+    read as "the model always misses far lookers", when the honest answer is
+    "we have never actually tested that, there is nothing to measure yet".
+    `n_pos`/`n_neg` are always included so a caller can tell the two cases
+    apart (a real 0% recall vs. no data) without re-deriving it.
     """
     yt = np.asarray(y_true).astype(int)
     yp = np.asarray(y_pred).astype(int)
@@ -121,22 +195,67 @@ def classification_metrics(y_true, y_pred) -> dict:
     tp = int(((yp == 1) & (yt == 1)).sum())
     fp = int(((yp == 1) & (yt == 0)).sum())
     fn = int(((yp == 0) & (yt == 1)).sum())
-    precision = tp / (tp + fp) if (tp + fp) else 0.0
-    recall = tp / (tp + fn) if (tp + fn) else 0.0
-    return {"accuracy": round(acc, 1), "precision": round(precision, 3),
-            "recall": round(recall, 3)}
+    n_pos = int((yt == 1).sum())
+    n_neg = int((yt == 0).sum())
+    precision = round(tp / (tp + fp), 3) if (tp + fp) else None
+    recall = round(tp / (tp + fn), 3) if (tp + fn) else None
+    return {"accuracy": round(acc, 1), "precision": precision, "recall": recall,
+            "n_pos": n_pos, "n_neg": n_neg}
+
+
+def class_weights(y) -> dict[int, float]:
+    """Balanced per-class loss weight: ``n_samples / (n_classes * class_count)``
+    (the same formula as sklearn's ``class_weight='balanced'``). The rarer
+    class gets a bigger weight, so a loss averaged over samples can't win just
+    by favouring whichever class happens to be more numerous. A class with 0
+    samples gets weight 1.0 (nothing to reweight, and it avoids a div-by-zero).
+    """
+    y = np.asarray(y).astype(int)
+    n = len(y)
+    counts = {0: int((y == 0).sum()), 1: int((y == 1).sum())}
+    return {c: (n / (2.0 * cnt)) if cnt > 0 else 1.0 for c, cnt in counts.items()}
+
+
+def best_threshold(y_true, probs, *, grid: np.ndarray | None = None) -> tuple[float, dict]:
+    """Sweep decision thresholds and return the one maximising F1 on the
+    positive ("looking") class, plus the metrics at that threshold.
+
+    MUST be called on a validation set, never on the held-out test set —
+    tuning the threshold against test data leaks test information into a
+    number then reported as "test performance", the same leakage class as the
+    train/test split itself, just one level up (a hyperparameter, not weights).
+    """
+    yt = np.asarray(y_true).astype(int)
+    p = np.asarray(probs).astype(float)
+    if grid is None:
+        grid = np.round(np.arange(0.05, 0.96, 0.01), 2)
+    best_t, best_f1, best_m = 0.5, -1.0, classification_metrics(yt, (p >= 0.5).astype(int))
+    for t in grid:
+        m = classification_metrics(yt, (p >= t).astype(int))
+        prec, rec = m["precision"], m["recall"]
+        f1 = (2 * prec * rec / (prec + rec)) if prec and rec and (prec + rec) > 0 else 0.0
+        if f1 > best_f1:
+            best_t, best_f1, best_m = float(t), f1, m
+    return best_t, {**best_m, "f1": round(best_f1, 3)}
 
 
 def coverage_text(df: pd.DataFrame, *, thin: int = 40) -> str:
     """Human-readable coverage report: where you have data and where you're thin.
 
-    Cells with fewer than `thin` samples are flagged — that's where to collect more.
+    Two severities, kept apart on purpose:
+      * ZERO  — no real example of that class at all in that slice. For
+        "distance_tier", this also means every "looking" row the model trains
+        on there is 100% synthetic (see `augment_far`) — there is nothing real
+        behind that number yet, which a generic "thin" warning would bury.
+      * thin  — some real examples, just fewer than `thin`. Collect more, but
+        it isn't fabricated-from-nothing the way a zero slice is.
     """
     if df.empty:
         return "Dataset is empty."
     lines = [f"Total samples: {len(df)}",
              f"  looking(1): {(df.label == 1).sum()}    away(0): {(df.label == 0).sum()}"]
-    warnings: list[str] = []
+    zero: list[str] = []
+    thin_warnings: list[str] = []
     for dim in ["distance_tier", "glasses", "headwear"]:
         lines.append(f"\nBy {dim}:")
         ct = (df.groupby([dim, "label"]).size().unstack(fill_value=0)
@@ -144,9 +263,17 @@ def coverage_text(df: pd.DataFrame, *, thin: int = 40) -> str:
         for value, row in ct.iterrows():
             away, look = int(row.get(0, 0)), int(row.get(1, 0))
             lines.append(f"  {value:<16} looking={look:<5} away={away:<5} total={look + away}")
-            if look < thin or away < thin:
-                warnings.append(f"{dim}={value} (looking={look}, away={away})")
-    if warnings:
+            if look == 0 or away == 0:
+                missing = "looking" if look == 0 else "away"
+                note = " (trained ONLY on synthetic/augmented rows there, if any)" \
+                    if dim == "distance_tier" and missing == "looking" else ""
+                zero.append(f"{dim}={value}: ZERO real '{missing}' examples{note}")
+            elif look < thin or away < thin:
+                thin_warnings.append(f"{dim}={value} (looking={look}, away={away})")
+    if zero:
+        lines.append("\nNO REAL DATA (collect this before trusting that number):")
+        lines.extend(f"  - {w}" for w in zero)
+    if thin_warnings:
         lines.append("\nThin coverage (collect more here):")
-        lines.extend(f"  - {w}" for w in warnings)
+        lines.extend(f"  - {w}" for w in thin_warnings)
     return "\n".join(lines)

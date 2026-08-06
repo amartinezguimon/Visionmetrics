@@ -34,7 +34,7 @@ def draw(frame, result: FrameResult, *, store_name: str, tracker):
             dist = f"{p.dist_m:.1f}m" if p.dist_m is not None else "?"
             cv2.putText(
                 frame,
-                f"Yaw:{p.yaw:+.2f} Pitch:{p.pitch:+.2f} Dist:{dist} "
+                f"Yaw:{p.yaw:+.1f}deg Pitch:{p.pitch:+.1f}deg Dist:{dist} "
                 f"Torso:{p.torso_conf:.0%} Zone:{p.zone_conf:.0%}",
                 (x1, dy), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 200, 255), 1,
             )

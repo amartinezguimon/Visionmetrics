@@ -1,0 +1,103 @@
+{
+  "data": "data/engagement_dataset.csv",
+  "n_train": 716,
+  "n_val": 27,
+  "n_test": 1125,
+  "n_train_identities": 11,
+  "n_val_identities": 1,
+  "n_test_identities": 1,
+  "class_weights": {
+    "away(0)": 0.5629,
+    "looking(1)": 4.475
+  },
+  "standardization": {
+    "features": [
+      "yaw",
+      "pitch",
+      "distance"
+    ],
+    "mean": [
+      -0.298385,
+      0.228442,
+      0.073814
+    ],
+    "std": [
+      0.5133,
+      0.242739,
+      0.0496
+    ]
+  },
+  "training": {
+    "max_epochs": 50,
+    "stopped_at_epoch": 14,
+    "early_stopped": true,
+    "had_validation_split": true
+  },
+  "threshold": {
+    "value": 0.38,
+    "chosen_on": "validation",
+    "val_metrics_at_threshold": {
+      "accuracy": 100.0,
+      "precision": 1.0,
+      "recall": 1.0,
+      "n_pos": 1,
+      "n_neg": 26,
+      "f1": 1.0
+    }
+  },
+  "overall": {
+    "accuracy": 94.2,
+    "precision": 0.904,
+    "recall": 0.997,
+    "n_pos": 595,
+    "n_neg": 530
+  },
+  "by": {
+    "distance_tier": {
+      "far 1.5-3.5m": {
+        "accuracy": 100.0,
+        "precision": null,
+        "recall": null,
+        "n_pos": 0,
+        "n_neg": 14,
+        "n": 14
+      },
+      "mid 0.5-1.5m": {
+        "accuracy": 94.1,
+        "precision": 0.895,
+        "recall": 0.998,
+        "n_pos": 455,
+        "n_neg": 468,
+        "n": 923
+      },
+      "near <0.5m": {
+        "accuracy": 94.1,
+        "precision": 0.933,
+        "recall": 0.993,
+        "n_pos": 140,
+        "n_neg": 48,
+        "n": 188
+      }
+    },
+    "glasses": {
+      "unknown": {
+        "accuracy": 94.2,
+        "precision": 0.904,
+        "recall": 0.997,
+        "n_pos": 595,
+        "n_neg": 530,
+        "n": 1125
+      }
+    },
+    "headwear": {
+      "unknown": {
+        "accuracy": 94.2,
+        "precision": 0.904,
+        "recall": 0.997,
+        "n_pos": 595,
+        "n_neg": 530,
+        "n": 1125
+      }
+    }
+  }
+}

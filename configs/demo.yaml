@@ -7,7 +7,7 @@ device:
 
 camera:
   source: 0            # cámara 0 (iPhone / Continuity por defecto). Si no abre, usa "ver cámaras".
-  fov_h_deg: 70.0
+  fov_h_deg: 70.0       # campo de visión HORIZONTAL real de la cámara (no el diagonal de la ficha técnica)
 
 vision:
   passerby_min_height_frac: 0.0   # 0 = cuenta todo (demo cruda). Sube a ~0.15 si cuela gente lejana.

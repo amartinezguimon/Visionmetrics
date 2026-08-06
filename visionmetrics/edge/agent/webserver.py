@@ -867,14 +867,21 @@ def _make_handler(state: _SharedState):
             if collector is None:
                 self._reply_json({"ok": False, "error": "collector required"})
                 return
+            # `subject` (who is IN FRONT of the camera) defaults to `collector`
+            # (who is running the session) when left blank — same convention as
+            # the console tool (training/collect.py). Blank/"unknown" subjects
+            # would otherwise all collapse onto one literal string, making every
+            # session look like the same person to a group-aware train/test
+            # split (dataset.group_key) and defeating its whole purpose.
+            subject_raw = str(payload.get("subject") or "").strip()
             row = {
                 "yaw": yaw, "pitch": payload.get("pitch"), "distance": payload.get("distance"),
                 "label": int(payload.get("label", 0)),
                 "distance_tier": payload.get("tier") or "",
                 "glasses": payload.get("glasses") or "unknown",
                 "headwear": payload.get("headwear") or "unknown",
-                "subject": (str(payload.get("subject")).strip() or "unknown")
-                           if payload.get("subject") else "unknown",
+                "subject": subject_raw if subject_raw and subject_raw.lower() != "unknown"
+                           else collector,
                 "collector": collector,
                 "session": state.session_id,
                 "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -2633,7 +2640,10 @@ async function saveGaze(fr, p, label) {
   const crop = cropB64(fr, p.box);
   const glasses = ($("mGlasses") && $("mGlasses").value) || "unknown";
   const headwear = ($("mHeadwear") && $("mHeadwear").value) || "unknown";
-  const subject = ($("mSubject") && $("mSubject").value.trim()) || "unknown";
+  // Defaults to the collector (same convention as the server / console tool) —
+  // NOT "unknown", or every session collapses onto one fake "person" for the
+  // group-aware train/test split.
+  const subject = ($("mSubject") && $("mSubject").value.trim()) || collector;
   const d = await post("/api/label", {
     key, yaw: p.yaw, pitch: p.pitch, distance: p.distance, label: label === "look" ? 1 : 0,
     tier: p.tier || tierFor(p.distance), collector, glasses, headwear, subject, crop,
@@ -2873,7 +2883,7 @@ $("rExportEng").onclick = () => {
   const collector = $("collector").value;
   const glasses = ($("mGlasses") && $("mGlasses").value) || "unknown";
   const headwear = ($("mHeadwear") && $("mHeadwear").value) || "unknown";
-  const subject = ($("mSubject") && $("mSubject").value.trim()) || "unknown";
+  const subject = ($("mSubject") && $("mSubject").value.trim()) || collector;
   const session = "live_" + Date.now();
   const at = new Date().toISOString();
   for (const fr of frames) {

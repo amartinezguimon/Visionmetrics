@@ -91,7 +91,8 @@ def _yes(question: str) -> bool:
 def _calibrar() -> None:
     print("\n  Calibrar el escaparate: pon la cámara donde irá fija, mira al centro del")
     print("  escaparate y captura con las teclas 1-5. S = guardar, Q = salir.")
-    _run(["visionmetrics/edge/tools/calibrate.py"], env={"VM_CAMERA": _camera()})
+    _run(["-m", "visionmetrics.edge.tools.calibrate", "--device-config", "configs/demo.yaml"],
+         env={"VM_CAMERA": _camera()})
 
 
 def _dibujar_zona() -> None:
