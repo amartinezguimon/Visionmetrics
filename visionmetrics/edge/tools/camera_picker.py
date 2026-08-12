@@ -64,16 +64,40 @@ def _snapshot(index: int, warm_secs: float = 1.5) -> tuple[bytes, tuple[int, int
     return buf.tobytes(), (w, h)
 
 
+def _indices_to_scan(max_index: int) -> list[int]:
+    """Which camera indices to snapshot. On macOS, ONLY the real enumerated devices:
+    asking OpenCV for an index beyond the camera count silently opens the DEFAULT
+    (built-in) camera, so probing 0..max_index would (a) show duplicate Mac cards for
+    every phantom index and (b) churn the iPhone's Continuity Camera enough to make it
+    drop after a couple of seconds. Off-macOS we can't name devices, so scan the range."""
+    import sys
+    if sys.platform == "darwin":
+        try:
+            from visionmetrics.edge.agent.capture import _mac_camera_names
+            n = len(_mac_camera_names())
+            if n:
+                return list(range(n))
+        except Exception:
+            pass
+    return list(range(max_index))
+
+
 def scan_cameras(max_index: int = MAX_INDEX) -> list[dict]:
     found = []
-    for i in range(max_index):
+    for i in _indices_to_scan(max_index):
         print(f"[camera-picker] probando cámara {i}...")
         result = _snapshot(i)
         if result is None:
             continue
         jpg, (w, h) = result
+        name = ""
+        try:
+            from visionmetrics.edge.agent.capture import camera_name_at
+            name = camera_name_at(i) or ""
+        except Exception:
+            name = ""
         found.append({
-            "index": i, "width": w, "height": h,
+            "index": i, "width": w, "height": h, "name": name,
             "b64": base64.b64encode(jpg).decode("ascii"),
         })
     return found
@@ -127,14 +151,28 @@ function pick(index, btn) {{
     body: JSON.stringify({{index: index}})
   }}).then(r => r.json()).then(d => {{
     btn.textContent = "✓ Guardada";
-    document.getElementById('status').textContent =
-      "Cámara " + index + " guardada. Ya puedes cerrar esta pestaña — " +
-      "la próxima vez que abras la demo usará esta cámara automáticamente.";
+    if (d.redirect) {{
+      // Esta MISMA pestaña se convierte en el panel: esperamos a que el servidor
+      // del panel esté arriba (lo lanza el programa justo después) y navegamos.
+      document.getElementById('status').textContent =
+        "Cámara " + index + " seleccionada. Abriendo el panel VisionMetrics…";
+      goTo(d.redirect);
+    }} else {{
+      document.getElementById('status').textContent =
+        "Cámara " + index + " seleccionada. Continúa en la ventana del programa. " +
+        "Puedes cerrar esta pestaña.";
+    }}
   }}).catch(() => {{
     document.getElementById('status').textContent = "Error guardando. Inténtalo de nuevo.";
     document.querySelectorAll('button').forEach(b => b.disabled = false);
     btn.textContent = "Usar esta cámara";
   }});
+}}
+function goTo(url) {{
+  // Sondea el panel hasta que responde y entonces redirige esta pestaña a él.
+  fetch(url, {{mode: 'no-cors', cache: 'no-store'}})
+    .then(() => {{ window.location.href = url; }})
+    .catch(() => setTimeout(() => goTo(url), 500));
 }}
 function rescan() {{
   document.getElementById('rescanBtn').disabled = true;
@@ -149,6 +187,7 @@ _CARD_TEMPLATE = """<div class="card">
   <img src="data:image/jpeg;base64,{b64}" alt="cámara {index}">
   <div class="body">
     <div class="meta">Cámara {index} · {width}x{height}</div>
+    <div class="meta" style="color:#e6edf3;font-weight:600;">{name}</div>
     <button onclick="pick({index}, this)">Usar esta cámara</button>
   </div>
 </div>"""
@@ -163,7 +202,7 @@ def _render_page(cams: list[dict]) -> str:
     return _PAGE_TEMPLATE.format(cards=cards, max_index_m1=MAX_INDEX - 1)
 
 
-def _make_handler(scan: "callable[[], list[dict]]", on_selected):
+def _make_handler(scan: "callable[[], list[dict]]", on_selected, after_url: str | None = None):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):
             pass
@@ -196,7 +235,10 @@ def _make_handler(scan: "callable[[], list[dict]]", on_selected):
                 self.end_headers()
                 return
             on_selected(index)
-            body = json.dumps({"ok": True, "index": index}).encode("utf-8")
+            resp = {"ok": True, "index": index}
+            if after_url:
+                resp["redirect"] = after_url
+            body = json.dumps(resp).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
@@ -207,7 +249,8 @@ def _make_handler(scan: "callable[[], list[dict]]", on_selected):
     return Handler
 
 
-def run(port: int = DEFAULT_PORT, open_browser: bool = True, max_index: int = MAX_INDEX) -> int:
+def run(port: int = DEFAULT_PORT, open_browser: bool = True, max_index: int = MAX_INDEX,
+        after_url: str | None = None) -> int:
     def scan() -> list[dict]:
         print("[camera-picker] escaneando cámaras (incluye Camo Studio / Continuity Camera)...")
         cams = scan_cameras(max_index)
@@ -219,10 +262,21 @@ def run(port: int = DEFAULT_PORT, open_browser: bool = True, max_index: int = MA
     def on_selected(index: int) -> None:
         selected["index"] = index
         PREF_FILE.parent.mkdir(parents=True, exist_ok=True)
-        PREF_FILE.write_text(str(index), encoding="utf-8")
-        print(f"[camera-picker] guardado -> {PREF_FILE} = {index}")
+        # Save BOTH the index AND the camera's NAME (its stable identity). macOS
+        # reshuffles indices between now and launch, so at launch we re-resolve
+        # the name to whatever index it currently holds — this is what guarantees
+        # "the camera you picked is the camera that actually runs".
+        name = None
+        try:
+            from visionmetrics.edge.agent.capture import camera_name_at
+            name = camera_name_at(index)
+        except Exception:
+            name = None
+        payload = json.dumps({"index": index, "name": name or ""}, ensure_ascii=False)
+        PREF_FILE.write_text(payload, encoding="utf-8")
+        print(f"[camera-picker] guardado -> {PREF_FILE} = {payload}")
 
-    handler = _make_handler(scan, on_selected)
+    handler = _make_handler(scan, on_selected, after_url)
     httpd = ThreadingHTTPServer(("127.0.0.1", port), handler)
     url = f"http://127.0.0.1:{port}/"
     print(f"[camera-picker] abriendo {url}")
@@ -243,8 +297,12 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=DEFAULT_PORT)
     ap.add_argument("--no-open", action="store_true", help="don't auto-open the browser")
     ap.add_argument("--max-index", type=int, default=MAX_INDEX)
+    ap.add_argument("--after-url", default=None,
+                    help="on pick, redirect the SAME browser tab here (e.g. the live "
+                         "dashboard) once it's reachable, instead of showing a dead-end")
     a = ap.parse_args()
-    return run(port=a.port, open_browser=not a.no_open, max_index=a.max_index)
+    return run(port=a.port, open_browser=not a.no_open, max_index=a.max_index,
+               after_url=a.after_url)
 
 
 if __name__ == "__main__":

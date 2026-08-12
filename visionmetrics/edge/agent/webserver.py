@@ -21,6 +21,7 @@ import argparse
 import base64
 import csv
 import datetime as dt
+import errno
 import json
 import os
 import shutil
@@ -37,9 +38,11 @@ from pathlib import Path
 import cv2
 
 from .build import build_pipeline
-from .capture import VideoSource, pick_external_camera, pick_working_camera
+from .capture import (VideoSource, camera_name_at, pick_chosen_external,
+                      pick_external_camera, pick_working_camera)
 from .config import DeviceConfig
 from .emitter import MetricEmitter, SessionCounters
+from .zone import FarLine
 from . import viewer
 from ...training.collect import SESSION_COLUMNS, tier_for
 from ...training.prep import full_frame_to_jpeg_b64
@@ -96,6 +99,12 @@ class _SharedState:
         # How often (seconds of session time) a whole frame is kept for review.
         # The main screen can change this before each session starts.
         self.review_seconds: float = 10.0
+        # Live-drawn "line of farness": two normalised [[x1,y1],[x2,y2]] points,
+        # or None = no line (count everyone). Reset to None at the start of EVERY
+        # session, so each session begins by prompting the operator to draw it
+        # afresh (or skip it). People past the line are still detected, drawn and
+        # recorded — they're just segmented out of the counts, not dropped.
+        self.far_line_points: list | None = None
         # Set only when the operator is fully finished (closes the review, or
         # Ctrl-C): the HTTP server keeps serving /api/frames + label endpoints
         # AFTER the camera stops so the post-session review can run, then exits.
@@ -147,6 +156,9 @@ class _SharedState:
         with self.lock:
             self.stopping.clear()
             self.jpeg = None
+            # Fresh session => no far-line yet; the operator is prompted to draw
+            # one (or skip) once the live video starts.
+            self.far_line_points = None
             self.review_frames = []
             self.review_new = []
             self.label_rows = {}
@@ -382,14 +394,24 @@ def _run_retrain(state: "_SharedState") -> None:
     # writes next to the weights, so the operator sees a headline number even
     # before the side-by-side comparison renders.
     acc = None
+    trust_ok = True
     metrics_path = Path(state.candidate_model_path).with_name("engagement_metrics.json")
     try:
-        acc = json.loads(metrics_path.read_text(encoding="utf-8")).get("overall", {}).get("accuracy")
+        _m = json.loads(metrics_path.read_text(encoding="utf-8"))
+        acc = _m.get("overall", {}).get("accuracy")
+        # train.py flags when val/test hold too few distinct PEOPLE for the
+        # numbers to mean anything. Carry that through instead of printing a
+        # bare percentage, which reads as a real result and quietly invites
+        # promoting a model validated on one face.
+        trust_ok = bool(_m.get("trustworthy", {}).get("ok", True))
     except (OSError, ValueError, AttributeError):
         pass
     msg = "Candidate ready — compare below."
     if acc is not None:
         msg = f"Candidate ready (held-out acc {acc}%) — compare below."
+        if not trust_ok:
+            msg = (f"Candidate ready (acc {acc}% — NOT trustworthy yet: too few distinct "
+                   f"people in val/test; collect more people before believing it).")
     _set(running=False, done=True, ok=True, msg=msg, log="\n".join(log_parts)[-4000:])
 
 
@@ -527,16 +549,46 @@ class BoxSmoother:
             self._seen.pop(tid, None)
 
 
-def _draw_boxes(frame, result, store_name: str, smoother: "BoxSmoother | None" = None):
+def _draw_boxes(frame, result, store_name: str, smoother: "BoxSmoother | None" = None,
+               far_line: "FarLine | None" = None, cam_name: str = ""):
     """Per-person boxes/labels only — no burned-in HUD block, since the
     browser sidebar (not the video) shows the running totals. When a `smoother`
     is given, the DRAWN box is its EMA (less twitch in crowds); the label anchor
-    and everything else still key off the smoothed rectangle."""
+    and everything else still key off the smoothed rectangle.
+
+    People past the far-line are drawn dimmed and tagged "IGNORADO" (not a dry box
+    like the counted ones), so the operator can visually confirm the line is cutting
+    the scene where they meant it to — the whole point of the segmentation."""
+    h, w = frame.shape[0], frame.shape[1]
+    # Burn the ACTUAL camera device name onto the video (top-left), so the operator
+    # can verify with their own eyes which physical camera is streaming — the macOS
+    # index↔name mapping has proven unreliable, so we show the ground truth on-screen.
+    if cam_name:
+        badge = f"CAMARA: {cam_name}"
+        (tw, th), _ = cv2.getTextSize(badge, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        cv2.rectangle(frame, (6, 6), (6 + tw + 12, 6 + th + 14), (0, 0, 0), -1)
+        cv2.putText(frame, badge, (12, 6 + th + 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+    # Draw the operator's line of farness itself (dashed cyan) so they can see it.
+    if far_line is not None:
+        ax, ay = int(far_line.a[0] * w), int(far_line.a[1] * h)
+        bx, by = int(far_line.b[0] * w), int(far_line.b[1] * h)
+        cv2.line(frame, (ax, ay), (bx, by), (0, 200, 255), 2)
+        cv2.putText(frame, "linea de lejania", (min(ax, bx), max(16, min(ay, by) - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 200, 255), 1)
     for p in result.persons:
         if smoother is not None:
             x1, y1, x2, y2 = smoother.smooth(p.track_id, p.bbox)
         else:
             x1, y1, x2, y2 = p.bbox
+        if getattr(p, "is_far", False):
+            # Ignored (too far): grey, thin, explicitly tagged so it's obvious this
+            # person is NOT being counted or shown the ad.
+            grey = (120, 120, 120)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), grey, 1)
+            cv2.putText(frame, f"ID:{p.track_id} IGNORADO", (x1, max(16, y1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, grey, 2)
+            continue
         color = viewer._TIER_COLOR.get(p.tier, (100, 100, 100))
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
         label = f"ID:{p.track_id}"
@@ -805,6 +857,29 @@ def _make_handler(state: _SharedState):
                     pass
                 state.start.set()
                 self._reply_json({"ok": True, "review_seconds": state.review_seconds})
+            elif self.path == "/api/far_line":
+                # Operator drew (or cleared) the line of farness on the live video.
+                # {"line": [[x1,y1],[x2,y2]]} in normalised [0..1] coords sets it;
+                # {"clear": true} (or no/invalid line) removes it => count everyone.
+                # Applied to the live pipeline on the very next frame — no restart.
+                payload = self._read_json()
+                if payload.get("clear"):
+                    with state.lock:
+                        state.far_line_points = None
+                    self._reply_json({"ok": True, "cleared": True})
+                else:
+                    line = payload.get("line")
+                    valid = (isinstance(line, list) and len(line) == 2
+                             and all(isinstance(p, (list, tuple)) and len(p) == 2
+                                     for p in line))
+                    if not valid:
+                        self._reply_json({"ok": False, "error": "need exactly 2 points"})
+                    else:
+                        pts = [[float(line[0][0]), float(line[0][1])],
+                               [float(line[1][0]), float(line[1][1])]]
+                        with state.lock:
+                            state.far_line_points = pts
+                        self._reply_json({"ok": True, "line": pts})
             elif self.path == "/api/restart":
                 # Save/Finish on the review or analysis screen: end this review
                 # and loop the server back to the main screen for a fresh
@@ -867,12 +942,20 @@ def _make_handler(state: _SharedState):
             if collector is None:
                 self._reply_json({"ok": False, "error": "collector required"})
                 return
-            # `subject` (who is IN FRONT of the camera) defaults to `collector`
-            # (who is running the session) when left blank — same convention as
-            # the console tool (training/collect.py). Blank/"unknown" subjects
-            # would otherwise all collapse onto one literal string, making every
-            # session look like the same person to a group-aware train/test
-            # split (dataset.group_key) and defeating its whole purpose.
+            # `subject` = who is IN FRONT of the camera. Left BLANK when unknown
+            # — deliberately NOT defaulted to `collector` (who is *running* the
+            # session). Defaulting looks helpful but is actively harmful: the
+            # operator is usually the same person across every session, so it
+            # stamps one identity ("subject:hector") onto every row ever
+            # collected. dataset.group_key prefers subject over session, so the
+            # whole dataset collapses to a SINGLE group and
+            # group_train_test_split dies with a cryptic
+            # "With n_samples=1, test_size=0.2 ... train set will be empty".
+            # Blank instead falls back to `session:<id>` — one group per sitting,
+            # which is a far better proxy for "one person" and always splittable.
+            # (Still a proxy: several sessions of the SAME person are treated as
+            # different identities, which flatters the metrics. Typing the real
+            # name in is what actually fixes that.)
             subject_raw = str(payload.get("subject") or "").strip()
             row = {
                 "yaw": yaw, "pitch": payload.get("pitch"), "distance": payload.get("distance"),
@@ -881,7 +964,7 @@ def _make_handler(state: _SharedState):
                 "glasses": payload.get("glasses") or "unknown",
                 "headwear": payload.get("headwear") or "unknown",
                 "subject": subject_raw if subject_raw and subject_raw.lower() != "unknown"
-                           else collector,
+                           else "unknown",
                 "collector": collector,
                 "session": state.session_id,
                 "captured_at": dt.datetime.now(dt.timezone.utc).isoformat(),
@@ -1095,7 +1178,9 @@ def _make_handler(state: _SharedState):
 
 def _run_one_session(config, state: "_SharedState", *, report_path: str | None,
                      record: bool, record_path: str | None, max_width: int,
-                     loop: bool, open_browser: bool, port: int) -> int:
+                     loop: bool, open_browser: bool, port: int,
+                     camera_name: str = "", avoid_builtin: bool = False,
+                     pin_identity: str | None = None) -> int:
     """Run ONE capture -> review cycle in the already-running HTTP server:
     (re)build the pipeline, open the camera, wait for the browser's ▶ Start,
     capture until Stop, then keep serving the post-stop review until the
@@ -1104,8 +1189,21 @@ def _run_one_session(config, state: "_SharedState", *, report_path: str | None,
     Returns 1 only if the camera can't be opened (fatal for the whole process)."""
     print("[web] loading models and building pipeline...")
     pipeline = build_pipeline(config)
+    # The live flow drives the far-line from the browser, per session (the operator
+    # draws it on the video or skips it). Ignore any far_line baked into the static
+    # calibration config so a session always starts with a clean slate — otherwise a
+    # line from a previous run would silently apply without being re-confirmed.
+    pipeline.far_line = None
 
-    vsource = VideoSource.from_config(config.camera, loop=loop)
+    vsource = VideoSource.from_config(config.camera, loop=loop,
+                                      identity_name=pin_identity or None,
+                                      avoid_builtin=avoid_builtin)
+    if pin_identity:
+        print(f"[web] cámara fijada por identidad: '{pin_identity}' "
+              f"(si se reconecta, se reabre ESA, nunca la del Mac)")
+    elif camera_name:
+        print(f"[web] cámara abierta por índice elegido en el selector "
+              f"(rótulo: '{camera_name}'); reconexión al mismo índice.")
     if not vsource.open():
         print(f"[web] ERROR: cannot open camera source {config.camera.source!r}")
         return 1
@@ -1245,6 +1343,9 @@ def _run_one_session(config, state: "_SharedState", *, report_path: str | None,
     last_review_t = -1e9
     # Cosmetic-only EMA so drawn boxes don't twitch/swim in busy scenes.
     box_smoother = BoxSmoother(alpha=0.4)
+    # Tracks the far-line currently applied to the pipeline, so we only rebuild the
+    # FarLine object when the operator actually draws/clears it (not every frame).
+    applied_fl_pts: list | None = None
     print("[web] running. Click 'Stop session' in the browser (or Ctrl-C here) to end.")
     try:
         while not state.stopping.is_set():
@@ -1256,6 +1357,16 @@ def _run_one_session(config, state: "_SharedState", *, report_path: str | None,
                 continue
             if scale < 1.0:
                 frame = cv2.resize(frame, (out_w, out_h))
+
+            # Pick up any far-line the operator just drew/cleared in the browser and
+            # apply it to the live pipeline (cheap: rebuild only on change).
+            with state.lock:
+                fl_pts = state.far_line_points
+            if fl_pts != applied_fl_pts:
+                applied_fl_pts = fl_pts
+                pipeline.far_line = (FarLine.from_config({"line": fl_pts})
+                                     if fl_pts else None)
+                print(f"[web] far-line {'set to ' + str(fl_pts) if fl_pts else 'cleared'}")
 
             now = time.time() if vsource.realtime else (frame_idx / file_fps)
             last_now = now
@@ -1286,7 +1397,16 @@ def _run_one_session(config, state: "_SharedState", *, report_path: str | None,
             review_people = [
                 {"id": p.track_id, "box": list(p.bbox), "yaw": p.yaw, "pitch": p.pitch,
                  "dist_m": p.dist_m, "distance": p.distance,
+                 # ALWAYS the real distance bucket, even for people past the
+                 # far-line. This value is written straight into the training
+                 # row's `distance_tier` (see the labeler in the browser), so a
+                 # pseudo-tier like "far-line" here would land in the dataset as
+                 # a 5th, bogus tier alongside near/mid/far/v-far and fragment
+                 # the per-tier coverage + accuracy report that exists precisely
+                 # to show where the model is weak. "Past the far-line" is a
+                 # SEPARATE fact and already travels as the `far` flag below.
                  "tier": tier_for(p.distance) if p.distance is not None else None,
+                 "far": bool(p.is_far),
                  "engaged": bool(p.is_engaged), "p_look": round(float(p.engage_prob), 4)}
                 for p in result.persons
             ]
@@ -1294,9 +1414,15 @@ def _run_one_session(config, state: "_SharedState", *, report_path: str | None,
             # clickable overlays on the live stream — separate from the
             # throttled review-photo queue below, which only fires periodically.
             current_boxes = [
-                {"id": p["id"], "box": p["box"], "tier": p["tier"], "engaged": p["engaged"]}
+                {"id": p["id"], "box": p["box"], "tier": p["tier"],
+                 "far": p["far"], "engaged": p["engaged"]}
                 for p in review_people
             ]
+            # Split "people on screen right now" into the counted (near side, shown
+            # the ad) vs ignored (past the far-line) — this is the segmentation the
+            # operator uses to check the line is placed right.
+            far_now = sum(1 for p in review_people if p["far"])
+            shown_now = len(review_people) - far_now
             t_session = time.time() - session_t0
             if t_session - last_review_t >= review_seconds:
                 last_review_t = t_session
@@ -1307,6 +1433,7 @@ def _run_one_session(config, state: "_SharedState", *, report_path: str | None,
                 people = [
                     {"id": p["id"], "box": p["box"], "yaw": p["yaw"], "pitch": p["pitch"],
                      "distance": p["distance"], "tier": p["tier"], "conf": p.get("conf"),
+                     "far": p["far"],
                      "engaged": p["engaged"], "p_look": p.get("p_look")}
                     for p in review_people
                 ]
@@ -1321,8 +1448,9 @@ def _run_one_session(config, state: "_SharedState", *, report_path: str | None,
                     if len(state.review_frames) > _REVIEW_QUEUE_CAP:
                         state.review_frames = state.review_frames[-_REVIEW_QUEUE_CAP:]
 
-            annotated = _draw_boxes(frame, result, config.device.store_name, box_smoother)
-            ok_enc, buf = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+            annotated = _draw_boxes(frame, result, config.device.store_name, box_smoother,
+                                    far_line=pipeline.far_line, cam_name=camera_name)
+            ok_enc, buf = cv2.imencode(".jpg", annotated, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
             with state.lock:
                 if ok_enc:
                     state.jpeg = buf.tobytes()
@@ -1332,6 +1460,10 @@ def _run_one_session(config, state: "_SharedState", *, report_path: str | None,
                     "engaged": pipeline.tracker.total_engaged,
                     "attention_s": round(pipeline.tracker.total_attention_s(), 1),
                     "people_now": len(result.active_ids),
+                    "shown_now": shown_now,
+                    "far_now": far_now,
+                    "far_line_on": applied_fl_pts is not None,
+                    "far_line": applied_fl_pts,
                     "elapsed_s": round(time.time() - session_t0, 1),
                     "boxes": current_boxes,
                     "frame_w": out_w,
@@ -1416,18 +1548,153 @@ def _run_one_session(config, state: "_SharedState", *, report_path: str | None,
     return 0
 
 
+class _ReusableHTTPServer(ThreadingHTTPServer):
+    # SO_REUSEADDR so a socket lingering in TIME_WAIT (from a just-closed server)
+    # doesn't block a quick relaunch. Doesn't help against a LIVE listener — that's
+    # what _free_stale_webserver handles.
+    allow_reuse_address = True
+    daemon_threads = True
+
+
+def _free_stale_webserver(port: int) -> bool:
+    """If a STALE VisionMetrics webserver is still holding `port`, kill it and
+    return True. Only ever kills a process whose command line is our OWN webserver
+    (checked via `ps`), so we never touch an unrelated app that happens to use the
+    port. macOS/Linux only — Windows relaunches are rare and handled by the message.
+
+    This exists because a previous run that didn't shut down cleanly leaves a
+    process on 8642, and the next launch died with 'Address already in use'. Now the
+    launch self-heals instead of forcing the user to hunt the zombie PID by hand."""
+    if sys.platform.startswith("win"):
+        return False
+    try:
+        out = subprocess.run(["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"],
+                             capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    pids = [p for p in out.stdout.split() if p.strip().isdigit()]
+    killed = False
+    for pid in pids:
+        if pid == str(os.getpid()):
+            continue
+        try:
+            cmd = subprocess.run(["ps", "-p", pid, "-o", "command="],
+                                 capture_output=True, text=True, timeout=5).stdout.lower()
+        except (OSError, subprocess.SubprocessError):
+            cmd = ""
+        # Only OUR webserver: a python process running the webserver module.
+        if "webserver" not in cmd or "python" not in cmd:
+            print(f"[web] el puerto {port} lo ocupa otro programa (PID {pid}), no lo toco.")
+            continue
+        print(f"[web] liberando el puerto {port}: mato un webserver VisionMetrics "
+              f"anterior que quedó colgado (PID {pid}).")
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.kill(int(pid), sig)
+            except (ProcessLookupError, ValueError):
+                break
+            except PermissionError:
+                print(f"[web] sin permiso para matar el PID {pid}.")
+                break
+            time.sleep(0.4)
+        killed = True
+    return killed
+
+
+def _make_server(port: int, handler) -> "ThreadingHTTPServer":
+    """Bind the dashboard server, self-healing a stale-zombie 'Address already in
+    use' once before giving up with a clear, actionable message."""
+    try:
+        return _ReusableHTTPServer(("0.0.0.0", port), handler)
+    except OSError as e:
+        if e.errno != errno.EADDRINUSE:
+            raise
+        if _free_stale_webserver(port):
+            time.sleep(0.6)
+            return _ReusableHTTPServer(("0.0.0.0", port), handler)
+        print(f"\n[web] ERROR: el puerto {port} ya está ocupado y no pude liberarlo "
+              f"automáticamente.\n"
+              f"      Ciérralo a mano:  lsof -nP -iTCP:{port} -sTCP:LISTEN   luego  "
+              f"kill -9 <PID>\n")
+        raise
+
+
 def run(config_path: str, *, debug: bool = False, report_path: str | None = None,
         source: str | None = None, port: int = DEFAULT_PORT,
         open_browser: bool = True, record: bool = True,
         record_path: str | None = None, review_sample_every: int = 30,
         review_seconds: float = 10.0,
-        max_width: int = 640, loop: bool = False) -> int:
+        max_width: int = 960, loop: bool = False) -> int:
     config = DeviceConfig.load(config_path)
     # "external" = the product rule: always film from an EXTERNAL camera
     # (phone / Camo / USB), never the machine's own built-in. We pick a working
     # external index and REFUSE to run (invalid source -> open() fails) if none
     # is present, instead of silently using the Mac's FaceTime camera.
-    if str(source).strip().lower() == "external":
+    # 'exact:<idx>' = the user EXPLICITLY picked this camera in the visual picker.
+    # Open EXACTLY it and never substitute a different index — honoring the choice
+    # matters more than showing *a* picture. This is what fixes "I pick my phone but
+    # the Mac's built-in runs instead": the auto-fallback below would jump to index 0
+    # (the always-ready FaceTime cam) when a phone/Continuity camera is slow to wake.
+    exact_choice = False
+    # Name (stable identity) + "never the Mac" flag for the chosen camera, threaded
+    # into VideoSource so a phone drop mid-session can never hand over to the built-in.
+    chosen_name = ""      # on-screen badge label (may be an unreliable macOS name)
+    pin_identity = None   # name to re-resolve on reconnect; None = reopen same index
+    avoid_builtin = False
+    if str(source).strip().lower() == "chosen":
+        # 'chosen' = use the camera the user picked in the visual selector, resolved
+        # HERE (same process as capture) so the unstable macOS index can't drift
+        # between picker and launch. We read the pref file, take its NAME (stable
+        # identity) + saved index, and pick the matching EXTERNAL camera — never the
+        # Mac's built-in. This is the fix for "I chose my phone but the Mac runs".
+        exact_choice = True
+        pref_name, pref_index = "", None
+        try:
+            import json as _json
+            pref_path = Path(__file__).resolve().parents[3] / "configs" / "camera_pref.txt"
+            raw = pref_path.read_text(encoding="utf-8").strip()
+            try:
+                data = _json.loads(raw)
+                if isinstance(data, dict):
+                    pref_name = str(data.get("name") or "")
+                    pref_index = int(data["index"]) if str(data.get("index", "")).lstrip("-").isdigit() else None
+                elif isinstance(data, int):
+                    pref_index = data            # legacy: file was a bare index number
+            except (ValueError, TypeError):
+                pref_index = int(raw) if raw.lstrip("-").isdigit() else None
+        except OSError:
+            pass
+        picked = pick_chosen_external(pref_name, pref_index)
+        if picked is None:
+            print("[web] ERROR: no encuentro tu cámara externa con imagen.\n"
+                  "      Este producto NUNCA usa la cámara del Mac.\n"
+                  "      1) Conecta el móvil / abre Camo y comprueba que VES el vídeo en la app.\n"
+                  "      2) Permiso de cámara: System Settings > Privacy & Security > Camera →\n"
+                  "         activa Terminal, cierra y reabre esta ventana.")
+            config.camera.source = -1  # fails to open -> clean exit, no built-in fallback
+        else:
+            print(f"[web] cámara ELEGIDA -> índice {picked} (la que viste y clicaste)")
+            config.camera.source = picked
+            # Honor the VISUAL pick: open exactly the index whose image the user
+            # clicked. We do NOT pin by name or reject "built-in-looking" names here,
+            # because on some Macs system_profiler's order disagrees with cv2's (index
+            # 0 can stream the iPhone yet be named "FaceTime") — that name logic was
+            # what "corrected" the good pick onto the Mac. The on-screen badge shows
+            # the device name so the operator can verify with their own eyes.
+            avoid_builtin = False
+            chosen_name = camera_name_at(picked)
+            chosen_name = (f"{chosen_name} · " if chosen_name else "") + f"índice {picked}"
+    elif str(source).strip().lower().startswith("exact:"):
+        exact_choice = True
+        idx_str = str(source).split(":", 1)[1].strip()
+        config.camera.source = int(idx_str) if idx_str.lstrip("-").isdigit() else idx_str
+        print(f"[web] cámara ELEGIDA por el usuario: índice {config.camera.source} "
+              f"(no se sustituirá por otra)")
+        if isinstance(config.camera.source, int):
+            avoid_builtin = True
+            pin_identity = camera_name_at(config.camera.source) or None
+            chosen_name = pin_identity or f"índice {config.camera.source}"
+    elif str(source).strip().lower() == "external":
         picked = pick_external_camera()
         if picked is None:
             print("[web] ERROR: no encuentro ninguna cámara EXTERNA con imagen.\n"
@@ -1439,11 +1706,16 @@ def run(config_path: str, *, debug: bool = False, report_path: str | None = None
         else:
             print(f"[web] cámara externa seleccionada: índice {picked}")
             config.camera.source = picked
+            avoid_builtin = True
+            pin_identity = camera_name_at(picked) or None
+            chosen_name = pin_identity or f"índice {picked}"
     elif source is not None:
         config.camera.source = int(source) if str(source).isdigit() else source
     # Explicit webcam index (or the config default): pick one that actually
-    # delivers an image. File/RTSP sources are left untouched.
+    # delivers an image. File/RTSP sources are left untouched. An 'exact:' choice
+    # is NEVER re-picked — we open precisely the camera the user selected.
     if isinstance(config.camera.source, int) and config.camera.source >= 0 \
+            and not exact_choice \
             and str(source).strip().lower() != "external":
         picked = pick_working_camera(config.camera.source)
         if picked is None:
@@ -1468,7 +1740,7 @@ def run(config_path: str, *, debug: bool = False, report_path: str | None = None
     state.candidate_model_path = str(
         Path(config.models.engagement).with_name("engagement_candidate.pth"))
 
-    httpd = ThreadingHTTPServer(("0.0.0.0", port), _make_handler(state))
+    httpd = _make_server(port, _make_handler(state))
     server_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     server_thread.start()
     url = f"http://localhost:{port}/"
@@ -1488,7 +1760,9 @@ def run(config_path: str, *, debug: bool = False, report_path: str | None = None
             rc = _run_one_session(
                 config, state, report_path=report_path, record=record,
                 record_path=record_path, max_width=max_width, loop=loop,
-                open_browser=open_browser, port=port)
+                open_browser=open_browser, port=port,
+                camera_name=chosen_name, avoid_builtin=avoid_builtin,
+                pin_identity=pin_identity)
             if rc != 0:
                 break  # camera failed to open — fatal
             if state.restart.is_set():
@@ -1659,6 +1933,30 @@ DASHBOARD_HTML = """<!DOCTYPE html>
   #stageInner { position:relative; width:100%; height:100%; min-height:0; line-height:0;
                 display:flex; align-items:center; justify-content:center; }
   #boxOverlay { position:absolute; inset:0; pointer-events:none; }
+  /* Far-line drawing surface + prompt, over the live stream. */
+  /* width/height:100% are REQUIRED: an <svg> is a replaced element, so inset:0
+     alone leaves it at its intrinsic 300x150 in the corner and only that tiny area
+     is clickable — the rest of the video wouldn't register clicks. */
+  #flOverlay { position:absolute; inset:0; width:100%; height:100%;
+               cursor:crosshair; z-index:6; }
+  #flPrompt {
+    position:absolute; left:50%; top:16px; transform:translateX(-50%);
+    max-width:min(560px, 92%); z-index:7; background:rgba(28,27,34,0.92); color:#fff;
+    border:1px solid rgba(255,255,255,0.18); border-radius:12px; padding:12px 16px;
+    font-size:13px; line-height:1.5; text-align:center; box-shadow:0 8px 28px rgba(0,0,0,0.35);
+  }
+  #flPrompt b { color:#ffcf3f; }
+  .flPromptBtns { margin-top:12px; display:flex; gap:10px; justify-content:center; }
+  .flBtnPrimary {
+    background:var(--look); color:#fff; border:1px solid var(--look);
+    border-radius:8px; padding:9px 18px; font-size:13px; font-weight:800; cursor:pointer; width:auto;
+  }
+  .flBtnPrimary:hover { filter:brightness(1.08); }
+  .flBtnGhost {
+    background:transparent; color:#fff; border:1px solid rgba(255,255,255,0.35);
+    border-radius:8px; padding:9px 16px; font-size:12.5px; font-weight:600; cursor:pointer; width:auto;
+  }
+  .flBtnGhost:hover { background:rgba(255,255,255,0.12); }
   #detectOverlay { position:absolute; inset:0; pointer-events:none; display:none; }
   .pbox {
     position:absolute; border:2px solid var(--accent); border-radius:4px; box-sizing:border-box;
@@ -1906,6 +2204,31 @@ DASHBOARD_HTML = """<!DOCTYPE html>
       <div id="stageInner">
         <img id="stream" src="/stream" alt="live camera">
         <canvas id="rcanvas" style="display:none;"></canvas>
+        <!-- Far-line drawing surface: transparent, captures the 2 clicks and shows
+             the provisional line while the operator draws it over the live video.
+             Only captures clicks while actually drawing (see flDrawing). -->
+        <svg id="flOverlay" style="display:none;"></svg>
+        <div id="flPrompt" style="display:none;">
+          <!-- Step 1: the choice — configure a line, or skip and count everyone. -->
+          <div id="flPromptIntro">
+            <b>📏 ¿Marcar hasta dónde cuenta?</b><br>
+            Puedes trazar una línea: lo que quede <b>al fondo</b> se marca
+            <b>IGNORADO</b> (se graba, pero no se cuenta), para comprobar si la
+            línea funciona.
+            <div class="flPromptBtns">
+              <button id="flConfig" class="flBtnPrimary">✏️ Configurar línea</button>
+              <button id="flSkip" class="flBtnGhost">Omitir · contar a todos</button>
+            </div>
+          </div>
+          <!-- Step 2: the actual 2-click drawing, with per-click guidance. -->
+          <div id="flPromptDraw" style="display:none;">
+            <b id="flStep">Punto 1 de 2</b><br>
+            <span id="flDrawHint">Haz clic en el <b>primer punto</b> de la línea, sobre el vídeo.</span>
+            <div class="flPromptBtns">
+              <button id="flCancel" class="flBtnGhost">Cancelar</button>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
 
@@ -1954,7 +2277,17 @@ DASHBOARD_HTML = """<!DOCTYPE html>
     <div class="panel">
       <h3>Right now</h3>
       <div class="stat"><span class="label">People in frame</span><span class="value accent" id="peopleNow">0</span></div>
+      <div class="stat"><span class="label"><span style="color:var(--look);">●</span> Mostrados (se cuentan)</span><span class="value look" id="shownNow">0</span></div>
+      <div class="stat"><span class="label"><span style="color:#8a8894;">●</span> Ignorados (al fondo)</span><span class="value" id="farNow">0</span></div>
       <div class="stat"><span class="label">Session time</span><span class="value" id="elapsed">0:00</span></div>
+    </div>
+    <div class="panel" id="farPanel">
+      <h3>Línea de lejanía</h3>
+      <div id="farState" style="font-size:12.5px; color:var(--muted); margin-bottom:10px; line-height:1.5;">
+        Sin línea — se cuenta a todo el mundo.
+      </div>
+      <button id="btnDrawFar" class="rbtn">📏 Dibujar línea</button>
+      <button id="btnClearFar" class="rbtn" style="margin-top:8px; display:none;">Quitar línea</button>
     </div>
     <div class="panel">
       <h3>Session totals</h3>
@@ -2250,6 +2583,145 @@ function renderFlow(flow) {
     `${dom}.<br>Stopped to look — from left <b>${lStop}%</b> · from right <b>${rStop}%</b>`;
 }
 
+// ================= Far-line (línea de lejanía) =================
+// The operator draws a 2-click line over the live video marking "everything past
+// here is too far to be a real customer". People past it are still detected, drawn
+// (as IGNORADO) and recorded — just segmented out of the counts, so the operator
+// can watch the split live and confirm the line sits where they meant it to.
+let flFrameW = 0, flFrameH = 0;   // camera frame size (for the click->normalised map)
+let flDrawing = false;
+let flPts = [];                   // points clicked so far: {x,y (overlay px), nx,ny (norm)}
+
+function updateFarState(on) {
+  const st = $("farState"), clr = $("btnClearFar"), draw = $("btnDrawFar");
+  if (!st) return;
+  if (on) {
+    st.innerHTML = "Línea activa — los del fondo salen como " +
+      "<b style='color:#8a8894'>IGNORADO</b> (se graban, no se cuentan).";
+    clr.style.display = "";
+    draw.textContent = "📏 Redibujar línea";
+  } else {
+    st.textContent = "Sin línea — se cuenta a todo el mundo.";
+    clr.style.display = "none";
+    draw.textContent = "📏 Dibujar línea";
+  }
+}
+
+// Invert the stream <img>'s object-fit:cover transform so a click maps to the
+// SAME normalised [0..1] image coords the pipeline tests feet against.
+function flClickToNorm(ev) {
+  const img = $("stream"), rect = img.getBoundingClientRect();
+  const iw = img.naturalWidth || flFrameW || rect.width;
+  const ih = img.naturalHeight || flFrameH || rect.height;
+  const scale = Math.max(rect.width / iw, rect.height / ih);   // cover => fill
+  const offX = (rect.width - iw * scale) / 2;                  // cropped edges (<=0)
+  const offY = (rect.height - ih * scale) / 2;
+  const px = (ev.clientX - rect.left - offX) / scale;
+  const py = (ev.clientY - rect.top - offY) / scale;
+  return [Math.min(1, Math.max(0, px / iw)), Math.min(1, Math.max(0, py / ih))];
+}
+
+function flRender() {
+  let h = "";
+  flPts.forEach((p) => {
+    h += `<circle cx="${p.x}" cy="${p.y}" r="6" fill="#ffcf3f" stroke="#000" stroke-width="1.5"/>`;
+  });
+  if (flPts.length === 2) {
+    h += `<line x1="${flPts[0].x}" y1="${flPts[0].y}" x2="${flPts[1].x}" y2="${flPts[1].y}" ` +
+         `stroke="#ffcf3f" stroke-width="3" stroke-dasharray="8 6"/>`;
+  }
+  $("flOverlay").innerHTML = h;
+}
+
+// Forward map (inverse of flClickToNorm): normalised [0..1] image coords -> overlay
+// px, honoring the same object-fit:cover transform. Used to KEEP the saved line
+// visible over the video (and correctly placed after a window resize).
+function flNormToPx(nx, ny) {
+  const img = $("stream"), rect = img.getBoundingClientRect();
+  const iw = img.naturalWidth || flFrameW || rect.width;
+  const ih = img.naturalHeight || flFrameH || rect.height;
+  const scale = Math.max(rect.width / iw, rect.height / ih);
+  const offX = (rect.width - iw * scale) / 2;
+  const offY = (rect.height - ih * scale) / 2;
+  return [nx * iw * scale + offX, ny * ih * scale + offY];
+}
+
+// Render the SAVED line (from the backend, normalised) persistently on the overlay,
+// so once drawn it stays visible for the rest of the session. The overlay is set to
+// pointer-events:none here so it doesn't swallow clicks while it's just displaying.
+function flRenderSaved(pts) {
+  const a = flNormToPx(pts[0][0], pts[0][1]);
+  const b = flNormToPx(pts[1][0], pts[1][1]);
+  $("flOverlay").innerHTML =
+    `<line x1="${a[0]}" y1="${a[1]}" x2="${b[0]}" y2="${b[1]}" ` +
+    `stroke="#ffcf3f" stroke-width="3" stroke-dasharray="8 6"/>` +
+    `<circle cx="${a[0]}" cy="${a[1]}" r="5" fill="#ffcf3f" stroke="#000" stroke-width="1.5"/>` +
+    `<circle cx="${b[0]}" cy="${b[1]}" r="5" fill="#ffcf3f" stroke="#000" stroke-width="1.5"/>`;
+}
+
+// Step 1: show the choice (Configurar / Omitir). Clicks are NOT captured yet.
+function flOpenPrompt() {
+  flDrawing = false; flPts = [];
+  $("flOverlay").style.display = "none"; $("flOverlay").innerHTML = "";
+  $("flPromptIntro").style.display = "";
+  $("flPromptDraw").style.display = "none";
+  $("flPrompt").style.display = "";
+}
+
+// Step 2: enter the actual drawing — now the overlay captures the 2 clicks.
+function flStartDraw() {
+  flDrawing = true; flPts = [];
+  const svg = $("flOverlay");
+  svg.style.display = ""; svg.style.pointerEvents = "";   // capture clicks again
+  svg.innerHTML = "";
+  $("flStep").textContent = "Punto 1 de 2";
+  $("flDrawHint").innerHTML = "Haz clic en el <b>primer punto</b> de la línea, sobre el vídeo.";
+  $("flPromptIntro").style.display = "none";
+  $("flPromptDraw").style.display = "";
+  $("flPrompt").style.display = "";
+}
+
+function flClose() {
+  flDrawing = false; flPts = [];
+  $("flOverlay").style.display = "none"; $("flOverlay").innerHTML = "";
+  $("flPrompt").style.display = "none";
+}
+
+async function flPost(body) {
+  try { await fetch("/api/far_line", { method: "POST", body: JSON.stringify(body) }); }
+  catch (e) {}
+}
+
+$("flOverlay").addEventListener("click", (ev) => {
+  if (!flDrawing) return;
+  const rect = $("stream").getBoundingClientRect();
+  const norm = flClickToNorm(ev);
+  flPts.push({ x: ev.clientX - rect.left, y: ev.clientY - rect.top, nx: norm[0], ny: norm[1] });
+  flRender();
+  if (flPts.length === 1) {
+    $("flStep").textContent = "Punto 2 de 2";
+    $("flDrawHint").innerHTML = "Ahora el <b>segundo punto</b> — la línea irá de uno a otro.";
+  } else if (flPts.length === 2) {
+    $("flDrawHint").innerHTML = "✓ Línea guardada. Los del fondo saldrán como <b>IGNORADO</b>.";
+    flPost({ line: [[flPts[0].nx, flPts[0].ny], [flPts[1].nx, flPts[1].ny]] });
+    updateFarState(true);
+    // Keep the drawn line VISIBLE: hide only the prompt banner and stop capturing
+    // clicks, but leave the overlay showing the line (poll() then keeps it rendered
+    // persistently from the saved backend coords for the rest of the session).
+    setTimeout(() => {
+      flDrawing = false;
+      $("flPrompt").style.display = "none";
+      $("flPromptDraw").style.display = "none";
+      $("flOverlay").style.pointerEvents = "none";
+    }, 900);
+  }
+});
+$("flConfig").addEventListener("click", () => flStartDraw());
+$("flCancel").addEventListener("click", () => flClose());
+$("flSkip").addEventListener("click", () => { flPost({ clear: true }); updateFarState(false); flClose(); });
+$("btnDrawFar").addEventListener("click", () => flStartDraw());   // sidebar: straight to drawing
+$("btnClearFar").addEventListener("click", () => { flPost({ clear: true }); updateFarState(false); flClose(); });
+
 // ================= PHASE 1 — live stats poll =================
 async function poll() {
   if (stopped || !started) return;   // idle on the main screen until ▶ Start
@@ -2258,6 +2730,22 @@ async function poll() {
     const d = await res.json();
     $("store").textContent = d.store_name || "Demo";
     $("peopleNow").textContent = d.people_now;
+    if (d.shown_now !== undefined) $("shownNow").textContent = d.shown_now;
+    if (d.far_now !== undefined) $("farNow").textContent = d.far_now;
+    if (d.frame_w) { flFrameW = d.frame_w; flFrameH = d.frame_h; }
+    updateFarState(d.far_line_on);
+    // Keep the saved line drawn on the overlay so it stays visible all session (and
+    // stays aligned if the window is resized). While actively drawing we leave the
+    // overlay alone so the in-progress points aren't clobbered.
+    if (!flDrawing) {
+      const ov = $("flOverlay");
+      if (d.far_line && d.far_line.length === 2) {
+        ov.style.display = ""; ov.style.pointerEvents = "none";
+        flRenderSaved(d.far_line);
+      } else {
+        ov.style.display = "none"; ov.style.pointerEvents = ""; ov.innerHTML = "";
+      }
+    }
     $("elapsed").textContent = fmtTime(d.elapsed_s);
     $("passersby").textContent = d.passersby;
     $("engaged").textContent = d.engaged;
@@ -2294,6 +2782,8 @@ async function startSession() {
   stopped = false; sawRunning = false; started = true;
   $("status").textContent = `Saving a training frame every ${secs}s. When you stop, you'll review them.`;
   showScreen("layout");
+  updateFarState(false);   // every session starts with NO line…
+  flOpenPrompt();          // …and asks: configure a line, or skip and count everyone
 }
 $("btnStart").onclick = () => startSession();
 
@@ -2336,6 +2826,7 @@ async function enterReview() {
     data = await res.json();
   } catch (e) { data = { frames: [] }; }
 
+  flClose();   // no live video to draw on once we enter post-stop review
   $("stream").style.display = "none";
   $("stopPanel").style.display = "none";
   $("reviewSummary").style.display = "block";
@@ -2412,7 +2903,9 @@ function boxTag(p, k) {
   if (det[k] === "notperson") return "not a person";
   if (gaze[k] === "look") return "looking";
   if (gaze[k] === "away") return "not looking";
-  return "#" + p.id + (p.tier ? " · " + p.tier.split(" ")[0] : "");
+  // `far` (past the far-line) is shown as its own marker, NOT as a fake tier —
+  // the tier stays the real distance bucket so it can go into the dataset clean.
+  return "#" + p.id + (p.tier ? " · " + p.tier.split(" ")[0] : "") + (p.far ? " · ignorado" : "");
 }
 function manualTag(mk) {
   if (gaze[mk] === "look") return "added · looking";
@@ -2640,10 +3133,11 @@ async function saveGaze(fr, p, label) {
   const crop = cropB64(fr, p.box);
   const glasses = ($("mGlasses") && $("mGlasses").value) || "unknown";
   const headwear = ($("mHeadwear") && $("mHeadwear").value) || "unknown";
-  // Defaults to the collector (same convention as the server / console tool) —
-  // NOT "unknown", or every session collapses onto one fake "person" for the
-  // group-aware train/test split.
-  const subject = ($("mSubject") && $("mSubject").value.trim()) || collector;
+  // Left BLANK when not typed in — deliberately NOT defaulted to the collector.
+  // The collector is the same person across every session, so defaulting stamps
+  // one identity on the entire dataset and the group-aware split collapses to a
+  // single group (and then crashes). Blank => the server groups by session.
+  const subject = ($("mSubject") && $("mSubject").value.trim()) || "";
   const d = await post("/api/label", {
     key, yaw: p.yaw, pitch: p.pitch, distance: p.distance, label: label === "look" ? 1 : 0,
     tier: p.tier || tierFor(p.distance), collector, glasses, headwear, subject, crop,
@@ -2883,7 +3377,10 @@ $("rExportEng").onclick = () => {
   const collector = $("collector").value;
   const glasses = ($("mGlasses") && $("mGlasses").value) || "unknown";
   const headwear = ($("mHeadwear") && $("mHeadwear").value) || "unknown";
-  const subject = ($("mSubject") && $("mSubject").value.trim()) || collector;
+  // "unknown" (not the collector) — same reasoning as the labeler above: the
+  // dataset loader then groups these rows by session instead of collapsing
+  // every session the operator ever ran onto one identity.
+  const subject = ($("mSubject") && $("mSubject").value.trim()) || "unknown";
   const session = "live_" + Date.now();
   const at = new Date().toISOString();
   for (const fr of frames) {
@@ -3757,9 +4254,11 @@ def main() -> int:
     ap.add_argument("--review-seconds", type=float, default=10.0,
                      help="post-session review: keep one full frame for labeling every N "
                           "seconds of the session (default: 10)")
-    ap.add_argument("--max-width", type=int, default=640,
+    ap.add_argument("--max-width", type=int, default=960,
                      help="downscale camera frames to at most this width before running the "
-                          "pipeline, so processing can keep up with the camera in realtime")
+                          "pipeline, so processing can keep up with the camera in realtime. "
+                          "960 keeps the live view sharp; drop to 640 if the feed gets choppy "
+                          "on a slower machine")
     ap.add_argument("--loop", action="store_true",
                      help="replay a file --source from the start when it ends (for demos/previews); "
                           "no effect on a live camera")

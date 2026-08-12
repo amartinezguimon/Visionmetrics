@@ -93,6 +93,60 @@ class CountingRegion:
 
 
 @dataclass(frozen=True)
+class FarLine:
+    """A calibrated "line of farness" (normalised [0..1] image coords, two endpoints).
+
+    A single straight — usually slanted — line drawn across the frame. Everything
+    on the FAR side of it (deeper into the scene / higher up the image, e.g. the
+    opposite pavement or the far end of the street) is treated as "too far to be a
+    customer": those tracks are neither counted nor scored for engagement.
+
+    Simpler and more robust than a full polygon when the only thing the operator
+    needs is a depth cutoff: two clicks and done. The "far" side is inferred
+    automatically as the side AWAY from the bottom of the frame (where the camera
+    stands and the nearest customers walk), so the operator never has to say which
+    half is which.
+
+    ``feet`` = bbox bottom-centre, same reference the counting zone uses.
+    ``None``/degenerate => no far cutoff (legacy behaviour).
+    """
+    a: tuple[float, float] = (0.0, 0.5)
+    b: tuple[float, float] = (1.0, 0.5)
+
+    @classmethod
+    def from_config(cls, block: dict | None) -> "FarLine | None":
+        """Build from the ``far_line`` block of a calibration config."""
+        if not block:
+            return None
+        line = block.get("line") or []
+        if len(line) != 2:                       # a line needs exactly 2 endpoints
+            return None
+        a = (float(line[0][0]), float(line[0][1]))
+        b = (float(line[1][0]), float(line[1][1]))
+        if a == b:                               # degenerate => no cutoff
+            return None
+        return cls(a=a, b=b)
+
+    def _side(self, x: float, y: float) -> float:
+        """Signed z-component of the cross product (b-a)×(p-a): >0 one side, <0 the
+        other, 0 exactly on the line. Sign alone tells you which half a point is in."""
+        ax, ay = self.a
+        bx, by = self.b
+        return (bx - ax) * (y - ay) - (by - ay) * (x - ax)
+
+    def is_far(self, feet_x: float, feet_y: float) -> bool:
+        """True if the feet fall on the FAR side of the line (away from frame bottom).
+
+        The reference "near" point is the bottom-centre of the frame (0.5, 1.0),
+        where the camera stands. A point is 'far' when it sits on the opposite side
+        of the line from that reference."""
+        ref = self._side(0.5, 1.0)
+        if abs(ref) < 1e-9:                       # line passes through the reference
+            ref = self._side(0.5, 2.0)            # push further "near" and retry
+        return self._side(feet_x, feet_y) * ref < 0.0
+
+
+@dataclass(frozen=True)
 class EngagementZone:
     """Calibrated boundaries for one display, produced by calibration."""
     yaw_min: float

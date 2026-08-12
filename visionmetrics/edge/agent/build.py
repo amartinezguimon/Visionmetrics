@@ -18,7 +18,7 @@ from .tracking import ReconcileParams
 from .vision.detector import PersonDetector
 from .vision.face import HeadPoseAnalyzer
 from .vision.pose import TorsoAnalyzer
-from .zone import CountingRegion, EngagementZone, GazeReference
+from .zone import CountingRegion, EngagementZone, FarLine, GazeReference
 
 
 def _load_calibration(config: DeviceConfig) -> dict | None:
@@ -47,6 +47,12 @@ def load_counting_region(config: DeviceConfig) -> CountingRegion | None:
     """Load the per-store counting polygon, or None (count everywhere)."""
     raw = _load_calibration(config)
     return CountingRegion.from_config(raw.get("counting_region")) if raw else None
+
+
+def load_far_line(config: DeviceConfig) -> FarLine | None:
+    """Load the per-store line of farness (depth cutoff), or None (no cutoff)."""
+    raw = _load_calibration(config)
+    return FarLine.from_config(raw.get("far_line")) if raw else None
 
 
 def build_pipeline(config: DeviceConfig) -> EngagementPipeline:
@@ -79,6 +85,7 @@ def build_pipeline(config: DeviceConfig) -> EngagementPipeline:
         zone=load_zone(config),
         gaze_reference=load_gaze_reference(config),
         counting_region=load_counting_region(config),
+        far_line=load_far_line(config),
         engagement_params=config.engagement,
         fov_h_deg=config.camera.fov_h_deg,
         passerby_min_frames=v.passerby_min_frames,

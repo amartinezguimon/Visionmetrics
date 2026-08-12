@@ -55,7 +55,10 @@ echo.
 
 :run
 set PYTHONUTF8=1
-"venv\Scripts\python.exe" -m visionmetrics.edge.agent.webserver --config configs/demo.yaml --source 0
+
+REM PRIMERA PANTALLA, SIEMPRE: elegir la camara (run.py --sitio abre el navegador con
+REM TODAS las camaras; al hacer clic, esa MISMA pestana se redirige al panel web).
+"venv\Scripts\python.exe" run.py --sitio
 echo.
 echo   Sesion terminada. Puedes cerrar esta ventana.
 pause

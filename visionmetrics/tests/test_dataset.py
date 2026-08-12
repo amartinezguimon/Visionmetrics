@@ -203,6 +203,43 @@ def test_group_train_test_split_falls_back_when_too_few_groups():
     assert len(train_df) + len(test_df) == len(df)
 
 
+def test_group_train_test_split_explains_a_single_identity_collapse():
+    """One identity can't be split without leaking, and the reason must be
+    legible. sklearn's own guard says "n_samples=1", which reads as "not enough
+    rows" when the real cause is that every row was stamped with the same
+    subject (the classic: subject defaulted to the operator's name).
+    """
+    import pytest
+
+    df = dataset.normalize(pd.concat([
+        _person_df("hector", "sess-1", 8, label=1),
+        _person_df("hector", "sess-2", 8, label=0),
+    ], ignore_index=True))
+    assert dataset.group_key(df).nunique() == 1        # precondition
+
+    with pytest.raises(ValueError) as err:
+        dataset.group_train_test_split(df, test_size=0.2, seed=1)
+
+    msg = str(err.value)
+    assert "ONE identity" in msg
+    assert "subject:hector" in msg                     # names the culprit value
+    assert "in front of the camera" in msg             # says how to fix it
+
+
+def test_blank_subject_groups_by_session_so_solo_sessions_still_split():
+    """The collector working alone: subject left blank on every row. Grouping
+    must fall back to the SESSION, giving one group per recording, so a
+    solo-collected dataset is still splittable (and leak-free)."""
+    df = dataset.normalize(pd.concat([
+        _person_df("unknown", f"sess-{i}", 6, label=i % 2) for i in range(6)
+    ], ignore_index=True))
+
+    assert dataset.group_key(df).nunique() == 6
+    train_df, test_df = dataset.group_train_test_split(df, test_size=0.2, seed=1)
+    assert set(dataset.group_key(train_df)).isdisjoint(set(dataset.group_key(test_df)))
+    assert len(train_df) and len(test_df)
+
+
 def test_coverage_text_flags_thin():
     df = dataset.normalize(pd.DataFrame({
         "yaw": [0.0] * 5, "pitch": [0.0] * 5, "distance": [0.3] * 5,

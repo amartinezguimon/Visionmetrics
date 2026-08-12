@@ -20,5 +20,9 @@
   "_counting_region_help": "OPTIONAL. The area that counts as your storefront. People whose feet fall outside it are ignored (e.g. someone across the street). Draw it with:  python -m visionmetrics.edge.tools.draw_zone --source 0 --config configs/store_config.json . Omit the block to count everywhere.",
   "counting_region": {
     "polygon": [[0.10, 0.45], [0.90, 0.45], [0.98, 1.0], [0.02, 1.0]]
+  },
+  "_far_line_help": "OPTIONAL. A single (usually slanted) line of farness — two endpoints in normalised [0..1] image coords. Feet on the FAR side (away from the frame bottom) are ignored: not counted, not scored for engagement. Simpler than a polygon when you only need a depth cutoff. Draw it with:  python -m visionmetrics.edge.tools.draw_line --source 0 --config configs/store_config.json . Omit the block for no cutoff.",
+  "far_line": {
+    "line": [[0.05, 0.45], [0.95, 0.55]]
   }
 }

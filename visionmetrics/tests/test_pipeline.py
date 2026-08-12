@@ -8,7 +8,7 @@ import numpy as np
 
 from visionmetrics.edge.agent.engagement import EngagementParams
 from visionmetrics.edge.agent.pipeline import EngagementPipeline
-from visionmetrics.edge.agent.zone import CountingRegion, GazeReference
+from visionmetrics.edge.agent.zone import CountingRegion, FarLine, GazeReference
 from visionmetrics.edge.agent.vision.detector import Detection
 from visionmetrics.edge.agent.vision.face import HeadPose
 from visionmetrics.edge.agent.vision.pose import TorsoResult, NEUTRAL
@@ -98,7 +98,8 @@ STRAIGHT = HeadPose(yaw=0.0, pitch=0.0, distance=0.19, dist_m=1.0, nose_px=(10, 
 def make_pipeline(detector, head_pose, classifier_prob, *,
                   passerby_min_frames=1, passerby_motion_px=40,
                   passerby_min_height_frac=0.0,
-                  classifier=None, gaze_reference=None, counting_region=None, **params):
+                  classifier=None, gaze_reference=None, counting_region=None,
+                  far_line=None, **params):
     return EngagementPipeline(
         detector=detector,
         head_pose=head_pose,
@@ -112,6 +113,7 @@ def make_pipeline(detector, head_pose, classifier_prob, *,
         passerby_min_height_frac=passerby_min_height_frac,
         gaze_reference=gaze_reference,
         counting_region=counting_region,
+        far_line=far_line,
     )
 
 
@@ -281,6 +283,43 @@ def test_person_tall_enough_passes_size_gate():
     for i in range(3):
         pipe.process_frame(FRAME, frame_idx=i, now=float(i))
     assert pipe.tracker.total_passersby == 1
+
+
+# Horizontal line of farness across the middle: feet above y=0.5 (deeper in the
+# scene) are "too far"; feet below it (near the camera at the bottom) are customers.
+MID_FAR_LINE = FarLine.from_config({"line": [[0.0, 0.5], [1.0, 0.5]]})
+
+
+def test_person_past_far_line_is_visible_but_not_counted():
+    # Feet at y2=120 -> 0.25 normalised, ABOVE the far line -> too far to be a
+    # customer. It is NOT counted or scored, but it IS still detected and exposed
+    # (is_far=True) so the operator can validate the line and analytics keep it.
+    far = Detection(track_id=1, bbox=(300, 40, 360, 120), confidence=0.9)
+    pipe = make_pipeline(FakeDetector([far]), FakeHeadPose(STRAIGHT), 1.0,
+                         passerby_min_frames=1, far_line=MID_FAR_LINE,
+                         count_threshold_s=1.0)
+    for i in range(5):
+        r = pipe.process_frame(FRAME, frame_idx=i, now=float(i))
+    assert pipe.tracker.total_passersby == 0
+    assert pipe.tracker.total_engaged == 0
+    # Still visible + segmentable: one person, marked far, never engaged.
+    assert len(r.persons) == 1
+    assert r.persons[0].is_far is True
+    assert r.persons[0].tier == "FAR"
+    assert r.persons[0].is_engaged is False
+    assert 1 in r.active_ids
+
+
+def test_person_near_side_of_far_line_is_counted():
+    # Same tool active, but feet at y2=400 -> 0.83 normalised, on the NEAR side.
+    near = Detection(track_id=1, bbox=(300, 80, 360, 400), confidence=0.9)
+    pipe = make_pipeline(FakeDetector([near]), FakeHeadPose(STRAIGHT), 1.0,
+                         passerby_min_frames=1, far_line=MID_FAR_LINE,
+                         count_threshold_s=1.0)
+    for i in range(3):
+        r = pipe.process_frame(FRAME, frame_idx=i, now=float(i))
+    assert pipe.tracker.total_passersby == 1
+    assert len(r.persons) == 1
 
 
 BOTTOM_HALF = CountingRegion.from_config(

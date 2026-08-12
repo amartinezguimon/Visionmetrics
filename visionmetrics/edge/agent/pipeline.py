@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from .camera_model import focal_length_px
 from .engagement import EngagementTracker, EngagementParams
 from .tracking import ReconcileParams, TrackReconciler
-from .zone import CountingRegion, EngagementZone, GazeReference, zone_confidence
+from .zone import CountingRegion, EngagementZone, FarLine, GazeReference, zone_confidence
 
 ENGAGE_THRESHOLD = 0.50
 
@@ -38,6 +38,10 @@ class PersonResult:
     total_engage_s: float = 0.0
     tier: str = "LOW"
     newly_counted: bool = False
+    # Feet fell on the FAR side of the operator's line: still detected and drawn
+    # (so the operator can validate the line) and its raw frame is still recorded
+    # for analytics, but it is NEVER counted or scored as a customer.
+    is_far: bool = False
 
 
 @dataclass
@@ -71,6 +75,7 @@ class EngagementPipeline:
         reconcile_params: ReconcileParams | None = None,
         gaze_reference: GazeReference | None = None,
         counting_region: CountingRegion | None = None,
+        far_line: FarLine | None = None,
     ):
         self.detector = detector
         self.head_pose = head_pose
@@ -83,6 +88,9 @@ class EngagementPipeline:
         # Operator-drawn counting zone (feet must fall inside to be counted at all).
         # None => count everywhere (uncalibrated behaviour).
         self.region = counting_region
+        # Operator-drawn "line of farness": tracks whose feet fall on the far side
+        # are too distant to be customers — never counted, never scored. None => off.
+        self.far_line = far_line
         self.fov_h_deg = fov_h_deg
         self.passerby_min_frames = max(1, passerby_min_frames)
         self.passerby_motion_px = passerby_motion_px
@@ -129,12 +137,29 @@ class EngagementPipeline:
                 "id": tid, "box": [x1, y1, x2, y2], "conf": round(det.confidence, 3),
             })
 
+            # Feet = bbox bottom-centre, normalised — the reference point both the
+            # far-line and the counting zone test against.
+            feet_x = cx / frame_w if frame_w else 0.0
+            feet_y = y2 / frame_h if frame_h else 0.0
+
+            # Far-line gate: feet past the operator's line of farness are too distant
+            # to be a customer. We do NOT drop them — the operator needs to SEE the
+            # far people (to validate the line is placed right) and we still record
+            # the raw frame for analytics. Instead we mark them is_far, expose them
+            # in the frame result (so overlay + review can segment shown-vs-ignored),
+            # and skip all counting/scoring below via `continue`.
+            if self.far_line is not None and self.far_line.is_far(feet_x, feet_y):
+                result.active_ids.add(tid)
+                result.persons.append(PersonResult(
+                    track_id=tid, bbox=(x1, y1, x2, y2),
+                    is_far=True, tier="FAR",
+                ))
+                continue
+
             # Inside the counting zone? (feet = bbox bottom-centre). With no zone
             # calibrated, everyone is "inside" (legacy behaviour).
             inside = True
             if self.region is not None:
-                feet_x = cx / frame_w if frame_w else 0.0
-                feet_y = y2 / frame_h if frame_h else 0.0
                 inside = self.region.contains(feet_x, feet_y)
                 if not inside:
                     # Outside the zone: remember we saw them out here (so a later

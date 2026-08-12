@@ -40,6 +40,14 @@ from pathlib import Path
 
 LEGACY = "data/engagement_data.csv"
 
+# Below this many distinct identities in a val/test slice, the metrics computed
+# on it describe a handful of specific people rather than the model's ability to
+# generalise, so they are reported with an explicit health warning.
+MIN_TRUSTWORTHY_IDS = 3
+# Empirically (see the grouped-split arithmetic) the point at which BOTH val and
+# test land >= MIN_TRUSTWORTHY_IDS at the default 0.2/0.15 split fractions.
+RECOMMENDED_IDS = 20
+
 
 def _resolve_data(path: str) -> str:
     if Path(path).exists():
@@ -100,6 +108,29 @@ def main() -> int:
     n_test_ids = dataset.group_key(test_df).nunique()
     print(f"[train] grouped split: {n_train_ids} train / {n_val_ids} val / "
           f"{n_test_ids} test identities (0 shared between any two)")
+
+    # How TRUSTWORTHY the numbers below are is set by the number of distinct
+    # PEOPLE in val/test, not the row count. A test slice of one person answers
+    # "how well does this work on that person", which a five-figure row count
+    # can make look like a general result. Say it out loud, next to the split,
+    # so a headline accuracy is never read as more than it is.
+    caveats = []
+    if n_test_ids < MIN_TRUSTWORTHY_IDS:
+        caveats.append(
+            f"test = {n_test_ids} identit{'y' if n_test_ids == 1 else 'ies'}: the accuracy "
+            f"below describes {'that one person' if n_test_ids == 1 else 'those few people'}, "
+            f"NOT how the model generalises to new faces")
+    if have_val and n_val_ids < MIN_TRUSTWORTHY_IDS:
+        caveats.append(
+            f"val = {n_val_ids} identit{'y' if n_val_ids == 1 else 'ies'}: the decision "
+            f"threshold and the early-stopping point are tuned on "
+            f"{'a single person' if n_val_ids == 1 else 'very few people'} and are likely noise")
+    if caveats:
+        print(f"\n[train] *** THESE METRICS ARE NOT YET TRUSTWORTHY ***")
+        for c in caveats:
+            print(f"  - {c}")
+        print(f"  Rule of thumb: ~{RECOMMENDED_IDS} distinct people gives >=3 in both val "
+              f"and test. More ROWS from the same people will not fix this — more PEOPLE will.\n")
 
     # 2) Augment ONLY the train slice; val and test stay 100% real rows.
     X_tr = train_df[dataset.FEATURES].to_numpy(dtype=float)
@@ -225,6 +256,16 @@ def main() -> int:
                             "std": np.round(feat_std, 6).tolist()},
         "training": {"max_epochs": a.epochs, "stopped_at_epoch": best_epoch,
                      "early_stopped": stopped_early, "had_validation_split": have_val},
+        # Travels WITH the numbers so the caveat survives the console scrollback:
+        # anything reading this file (the dashboard's candidate-vs-live compare,
+        # or you in three weeks) can tell a real result from one measured on a
+        # couple of people.
+        "trustworthy": {
+            "ok": not caveats,
+            "min_identities_required": MIN_TRUSTWORTHY_IDS,
+            "recommended_identities": RECOMMENDED_IDS,
+            "caveats": caveats,
+        },
         "threshold": {"value": round(threshold, 3),
                       "chosen_on": "validation" if have_val else "default (no validation data)",
                       "val_metrics_at_threshold": val_at_threshold},

@@ -69,6 +69,9 @@ calibration:
   # counts) — draw it with:
   #   python -m visionmetrics.edge.tools.draw_zone --source 0 --config configs/store_config.json
   # People whose feet fall outside it are never counted (fixes "far people counted").
+  # Simpler alternative: a "far_line" (two endpoints) — everyone past it (deeper in
+  # the scene) is ignored. Draw it with:
+  #   python -m visionmetrics.edge.tools.draw_line --source 0 --config configs/store_config.json
   config_path: "configs/store_config.json"
 
 uplink:

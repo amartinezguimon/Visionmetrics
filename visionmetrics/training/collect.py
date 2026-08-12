@@ -250,7 +250,11 @@ def main() -> int:
     ap.add_argument("--output", default=None,
                     help="CSV to write (default: data/raw_sessions/<timestamp>_<collector>.csv)")
     ap.add_argument("--collector", default="unknown", help="who is running the capture (e.g. hector)")
-    ap.add_argument("--subject", default=None, help="who is in front of the camera (defaults to --collector)")
+    ap.add_argument("--subject", default=None,
+                    help="who is in front of the camera. Leave unset only when you "
+                         "genuinely don't know: rows then group by SESSION for the "
+                         "train/test split. Do NOT assume it's the collector — that "
+                         "would tag every session with one identity and collapse the split.")
     ap.add_argument("--glasses", choices=["yes", "no", "unknown"], default="unknown")
     ap.add_argument("--headwear", choices=["none", "cap", "hat", "hood", "unknown"], default="unknown")
     ap.add_argument("--fov", type=float, default=70.0, help="camera horizontal FOV (deg)")
@@ -262,7 +266,7 @@ def main() -> int:
     return run(a.camera, a.output, fov_h_deg=a.fov, every=a.every, conf=a.conf,
                aspect=a.aspect, config_path=a.config,
                glasses=a.glasses, headwear=a.headwear,
-               subject=a.subject or a.collector, collector=a.collector)
+               subject=a.subject or "unknown", collector=a.collector)
 
 
 if __name__ == "__main__":

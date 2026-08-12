@@ -139,6 +139,26 @@ def group_train_test_split(
     n_groups = len(set(groups))
     n_splits = max(2, round(1.0 / test_size))
 
+    # A single identity cannot be split into train and test without putting the
+    # same person on both sides — the exact leak this function exists to
+    # prevent. sklearn does stop it, but with a numeric message about
+    # `n_samples=1` that reads like a bug in the data size rather than what it
+    # actually is: everything collapsed onto one group. Say so plainly.
+    if n_groups < 2:
+        only = next(iter(set(groups)), "?")
+        raise ValueError(
+            f"Cannot split: all {len(df)} rows belong to ONE identity ({only!r}).\n"
+            "A grouped train/test split needs at least 2 distinct identities, or "
+            "the same person ends up in both train and test.\n"
+            "Fix by giving the rows real identities:\n"
+            "  * type the SUBJECT (who is in front of the camera) when labelling — "
+            "best, and the only thing that makes the metrics honest; or\n"
+            "  * leave subject blank/'unknown' so rows group by session instead "
+            "(each recording session becomes its own group).\n"
+            "If every row says subject=<the operator's name>, that is the cause: "
+            "the subject is who is IN FRONT of the camera, not who is running it."
+        )
+
     if n_groups < n_splits:
         splitter = GroupShuffleSplit(n_splits=1, test_size=test_size, random_state=seed)
         train_idx, test_idx = next(splitter.split(df, labels, groups))

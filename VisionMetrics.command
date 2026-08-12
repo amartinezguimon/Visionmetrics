@@ -51,10 +51,10 @@ if [ ! -x "venv/bin/python" ]; then
 fi
 
 # Al arrancar, el programa descarga los modelos que falten (MediaPipe + YOLO)
-# automáticamente. --source external => SIEMPRE usa la cámara EXTERNA
-# (móvil / Camo / USB), nunca la del Mac; si no hay externa, avisa y no arranca.
+# automáticamente. run.py --sitio: PRIMERA PANTALLA = selector de cámara y, al
+# elegir, esa MISMA pestaña se redirige al panel web (vista en vivo + etiquetado).
 export PYTHONUTF8=1
-venv/bin/python -m visionmetrics.edge.agent.webserver --config configs/demo.yaml --source external
+venv/bin/python run.py --sitio
 
 echo ""
 echo "  Sesión terminada. Puedes cerrar esta ventana."

@@ -3,7 +3,7 @@
 import math
 
 from visionmetrics.edge.agent.zone import (
-    CountingRegion, EngagementZone, GazeReference, zone_confidence,
+    CountingRegion, EngagementZone, FarLine, GazeReference, zone_confidence,
 )
 
 
@@ -27,6 +27,34 @@ def test_counting_region_contains_triangle():
     assert r is not None
     assert r.contains(0.1, 0.1) is True
     assert r.contains(0.9, 0.9) is False   # outside the hypotenuse
+
+
+def test_far_line_none_when_empty_or_wrong_point_count():
+    assert FarLine.from_config(None) is None
+    assert FarLine.from_config({}) is None
+    assert FarLine.from_config({"line": [[0.0, 0.5]]}) is None            # 1 point
+    assert FarLine.from_config({"line": [[0, 0], [0, 0], [1, 1]]}) is None  # 3 points
+    assert FarLine.from_config({"line": [[0.5, 0.5], [0.5, 0.5]]}) is None  # degenerate
+
+
+def test_far_line_horizontal_far_is_above():
+    # A horizontal line across the middle: feet ABOVE it (smaller y, deeper into
+    # the scene) are far; feet BELOW it (near the camera at the frame bottom) aren't.
+    fl = FarLine.from_config({"line": [[0.0, 0.5], [1.0, 0.5]]})
+    assert fl is not None
+    assert fl.is_far(0.5, 0.2) is True    # up high => far
+    assert fl.is_far(0.5, 0.8) is False   # down low => near
+    assert fl.is_far(0.5, 0.5) is False   # exactly on the line => not far
+
+
+def test_far_line_slanted_endpoints_dont_flip_meaning():
+    # Endpoint order shouldn't change which side is "far"; the reference (frame
+    # bottom-centre) fixes it. Draw the same slanted line both ways.
+    ab = FarLine.from_config({"line": [[0.05, 0.45], [0.95, 0.55]]})
+    ba = FarLine.from_config({"line": [[0.95, 0.55], [0.05, 0.45]]})
+    for fl in (ab, ba):
+        assert fl.is_far(0.5, 0.1) is True    # top of frame => far
+        assert fl.is_far(0.5, 0.95) is False  # bottom of frame => near
 
 
 def test_gaze_reference_defaults_to_no_shift():
